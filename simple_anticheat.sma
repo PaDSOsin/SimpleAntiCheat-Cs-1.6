@@ -1,58 +1,121 @@
+/*
+ * Simple AntiCheat
+ *
+ * Server-side cheat detection for Counter-Strike 1.6 (AMX Mod X 1.8.2+).
+ *
+ * Checks:
+ *   - client cvars: cheat cvars, protected values, trap cvar, query blocking
+ *   - player model consistency
+ *   - speedhack, fps limit, invalid pitch, spinbot
+ *   - bhop / duck scripts, strafe helpers, non-keyboard movement, autostop
+ *   - aim: snap, silent, smooth, mouse step (GCD), no-recoil, trigger, autofire
+ *   - headshot ratio
+ *
+ * Every detection adds violation level (VL); the player is punished when VL
+ * reaches ac_vl_kick. VL decays over time and is kept between sessions.
+ *
+ * 1.3:
+ *   - #20 (fps): fps is measured against both usercmd msec and server real
+ *     time (the lower value is used), so msec rounding at high fps no longer
+ *     inflates it; default ac_fps_max raised from 105 to 1000 (high fps is
+ *     allowed, only values a normal client cannot reach are flagged. 
+ *     temporary commented, to change it later(kick on 100+ fps)).
+ *   - #12 (nokeys): a move that is left over from a key that was really held
+ *     (ESC menu / console / stuck key) is no longer counted as moving without
+ *     keys, and frames with a frozen view (menu open) are skipped.
+ *
+ * 1.3.1:
+ *   - #16 (gcd): a view kick that does not come from the mouse (being hit,
+ *     especially in the head, or a fall) moves the client view without the
+ *     mouse step; combined with own mouse movement those turns were counted as
+ *     off-step and the player was kicked. GCD samples are now skipped while
+ *     such a kick is active: from the hit until the punch angle has decayed,
+ *     plus ac_gcd_hit seconds and the player's ping (0 = old behaviour).
+ *
+ * 1.3.2:
+ *   - #24 (autostop): during freezetime (buy time) the player cannot move, so
+ *     the client sends a zero move while W/A/S/D are held; this was counted as
+ *     autostop and the player was kicked. The freeze period is now tracked by
+ *     the round events (new round -> Round_Start) and autostop is not checked
+ *     while it lasts, nor while the player's speed is locked (maxspeed <= 1 or
+ *     FL_FROZEN). After the unlock the check stays off for AUTOSTOP_UNLOCK
+ *     seconds plus the player's ping, because the client still moves with the
+ *     old (locked) speed until it receives the new one.
+ *
+ * Commands:
+ *   amx_acstats [name|#userid]           - VL and sample counters
+ *   amx_acdebug <name|#userid> [seconds] - dump usercmds to the debug log
+ *   amx_acreset <name|#userid>           - clear VL and samples
+ *
+ * Files:
+ *   configs/simple_anticheat.cfg - cvars
+ *   configs/simple_anticheat.ini - cheat / protected cvar lists
+ *   logs/anticheat.log           - detections
+ *   logs/ac_debug.log            - frame dumps
+ */
 #include <amxmodx>
 #include <amxmisc>
 #include <fakemeta>
 #include <hlsdk_const>
 #include <nvault>
-#pragma tabsize 0
 #define PLUGIN  "Simple AntiCheat"
-#define VERSION "1.1"
+#define VERSION "1.3.2"
 #define AUTHOR  "Rust"
+// Player slots and task id bases
 #define MAXP              33
 #define TASK_CHECK        5100
 #define TASK_SECOND       5200
 #define TASK_QUERY        5300
 #define TASK_VERIFY       5400
 #define TASK_KICK         5500
+// Files
 #define LOG_FILE          "anticheat.log"
 #define DEBUG_FILE        "ac_debug.log"
 #define VAULT_NAME        "simple_anticheat"
 #define CFG_FILE          "simple_anticheat.cfg"
 #define LIST_FILE         "simple_anticheat.ini"
+// Cvar lists, logging and admin notifications
 #define MAX_LIST          64
 #define LOG_ONLY_COOLDOWN 30.0
 #define ADMIN_MSG_DELAY   3.0
 #define ADMIN_NOTIFY_FLAG ADMIN_BAN
+// Jump / duck script detection
 #define BHOP_CHAIN_MS     100
 #define JUMP_MIN_AIR_MS   80
 #define JUMP_EXACT_MSEC   12
-#define JUMP_TAP_MSEC     25 
+#define JUMP_TAP_MSEC     25
 #define JUMP_TAP_FRAMES   3
 #define SPAM_MIN_PRESSES  4
 #define BTN_JUMP          0
 #define BTN_DUCK          1
+// Autofire
 #define AUTOFIRE_MAX_MSEC 4
 #define AUTOFIRE_MAX_GAP  400
 #define AUTOFIRE_MAX_HOLD 2
+// Timing
 #define SPAWN_GRACE       1.5
+#define AUTOSTOP_UNLOCK   1.0
 #define CHECK_JITTER      0.3
 #define VERIFY_TIMEOUT    6.0
+// Move vector, mouse step (GCD) and recoil tolerances
 #define VECTOR_MIN_MOVE   30.0
 #define VECTOR_TOLERANCE  0.01
 #define GCD_TOLERANCE     0.006
 #define GCD_MIN_STEP      0.025
 #define RECOIL_MIN_PUNCH  0.1
+// View kick from a hit / fall: punch growth that starts the GCD pause and the
+// punch size below which the kick counts as decayed
+#define HIT_PUNCH_MIN     0.05
+#define HIT_PUNCH_IDLE    0.01
 #define RECOIL_TOLERANCE  0.02
-#define WH_CACHE_SHOW     0.25
-#define WH_CACHE_HIDE     0.06
-#define WH_PREDICT_MIN    0.10
-#define WH_PREDICT_MAX    0.35
-#define WH_NEAR           128.0
-#define WH_SIDE           22.0
-#define WH_PASSES         3
+// Line of sight: how many see-through entities a trace may skip
+#define TRACE_PASSES      3
+// Ring buffer sizes
 #define RING              64
 #define SEC_RING          30
 #define FRAMES            64
 #define STREAMS           22
+// Event streams (hits / total inside a time window)
 #define ST_BHOP           0
 #define ST_GSTRAFE        1
 #define ST_STRAFE         2
@@ -75,17 +138,21 @@
 #define ST_HS             19
 #define ST_AUTOSTOP       20
 #define ST_SILENT_STRONG  21
+// Position history used for lag compensation
 #define RW_SIZE           64
 #define RW_STEP           0.008
+// Aim analysis
 #define AIM_NONE          999.0
 #define AIM_MAX_ERR       30.0
 #define SMOOTH_MIN_MAG    0.08
 #define SMOOTH_QUANT      0.008
 #define SMOOTH_K_MIN      0.30
 #define SMOOTH_K_MAX      0.95
+// Movement state of a usercmd
 #define MOVE_GROUND       0
 #define MOVE_AIR          1
 #define MOVE_OTHER        2
+// Client cvars queried from players
 #define CL_FWD            0
 #define CL_BACK           1
 #define CL_SIDE           2
@@ -95,15 +162,20 @@
 #define CL_MACCEL         6
 #define CL_INTERP         7
 #define CL_TOTAL          8
+// Detections that re-check client settings before punishing
 #define VERIFY_GCD        0
 #define VERIFY_VECTOR     1
 #define VERIFY_SILENT     2
 #define VERIFY_KINDS      3
+// Weapon groups
 #define BITS_NOGUN  ((1<<CSW_KNIFE)|(1<<CSW_HEGRENADE)|(1<<CSW_FLASHBANG)|(1<<CSW_SMOKEGRENADE)|(1<<CSW_C4))
 #define BITS_PISTOL ((1<<CSW_GLOCK18)|(1<<CSW_USP)|(1<<CSW_P228)|(1<<CSW_DEAGLE)|(1<<CSW_ELITE)|(1<<CSW_FIVESEVEN))
 #define BITS_AUTO   ((1<<CSW_MP5NAVY)|(1<<CSW_TMP)|(1<<CSW_P90)|(1<<CSW_MAC10)|(1<<CSW_UMP45)|(1<<CSW_AK47)|(1<<CSW_M4A1)|(1<<CSW_GALIL)|(1<<CSW_FAMAS)|(1<<CSW_SG552)|(1<<CSW_AUG)|(1<<CSW_M249))
-#define CVF(%1) (Float:g_cv[%1])
-#define CVI(%1) floatround(Float:g_cv[%1])
+// Cached cvar access. The Float: override is required: a cell indexed
+// with an enum constant takes the tag of that constant, not of the array.
+#define CVF(%1) (Float:g_fCv[%1])
+#define CVI(%1) (g_iCv[%1])
+// Detection ids: the number shown in "Detect #N"
 enum
 {
     DETECT_NONE = 0,
@@ -133,6 +205,7 @@ enum
     DETECT_AUTOSTOP,        // #24
     DETECT_TOTAL
 };
+// Cvar indexes
 enum
 {
     CV_FIRST_CHECK = 0,
@@ -219,6 +292,7 @@ enum
     CV_GCD_VL,
     CV_GCD_CONTEXT,
     CV_GCD_FOV,
+    CV_GCD_HIT,
     CV_RECOIL,
     CV_RECOIL_SAMPLES,
     CV_RECOIL_PERCENT,
@@ -269,12 +343,12 @@ enum
     CV_AUTOSTOP_COUNT,
     CV_AUTOSTOP_WINDOW,
     CV_AUTOSTOP_VL,
-    CV_ANTIWH,
     CV_PUNISH,
     CV_BAN_TIME,
     CV_ADMIN_NOTIFY,
     CV_TOTAL
 };
+// Default lists, used when simple_anticheat.ini is missing
 new const g_szCheatCvarsDef[][] =
 {
     "ac_example_cheat_cvar_1",
@@ -294,6 +368,7 @@ new const Float:g_fProtAllowedDef[] =
     1.0,
     0.0
 };
+// Client cvars and their stock values
 new const g_szClientCvars[CL_TOTAL][] =
 {
     "cl_forwardspeed",
@@ -309,10 +384,12 @@ new const Float:g_fClientDefault[CL_TOTAL] =
 {
     400.0, 400.0, 400.0, 0.0, 0.022, 0.0, 0.0, 0.1
 };
+// Forward / side move ratios that a keyboard can produce
 new const Float:g_fKeyRatios[] =
 {
     0.25, 0.3333, 0.5, 0.6667, 0.75, 1.0, 1.3333, 1.5, 2.0, 3.0, 4.0
 };
+// Player models that must match the server copy
 new const g_szModels[][] =
 {
     "models/player/arctic/arctic.mdl",
@@ -325,6 +402,7 @@ new const g_szModels[][] =
     "models/player/urban/urban.mdl",
     "models/player/vip/vip.mdl"
 };
+// Lookup tables for the jump / duck script checks (index: BTN_*)
 new const g_iBtnBit[2]       = { IN_JUMP, IN_DUCK };
 new const g_iBtnFlag[2]      = { DETECT_BHOP, DETECT_GSTRAFE };
 new const g_iBtnOn[2]        = { CV_BHOP, CV_GSTRAFE };
@@ -341,32 +419,51 @@ new const g_iBtnCvTapP[2]    = { CV_BHOP_TAP_PERCENT, CV_GSTRAFE_TAP_PERCENT };
 new const g_iBtnCvSpamN[2]   = { CV_BHOP_SPAM_JUMPS, CV_GSTRAFE_SPAM_DUCKS };
 new const g_iBtnCvSpamP[2]   = { CV_BHOP_SPAM_PERCENT, CV_GSTRAFE_SPAM_PERCENT };
 new const g_szBtnName[2][]   = { "bhop", "dd/gstrafe" };
+// Lookup tables for settings verification (index: VERIFY_*)
+new const g_iVerifyFlag[VERIFY_KINDS]   = { DETECT_GCD, DETECT_VECTOR, DETECT_SILENT };
+new const g_iVerifyStream[VERIFY_KINDS] = { ST_GCD, ST_VECTOR, ST_SILENT_STRONG };
+new const g_iVerifyFirst[VERIFY_KINDS]  = { CL_SENS, CL_FWD, CL_FWD };
+new const g_iVerifyLast[VERIFY_KINDS]   = { CL_MACCEL, CL_SIDE, CL_MACCEL };
+// Cvar lists
 new g_szCheatCvars[MAX_LIST][32];
 new g_iCheatCount;
 new g_szProtCvars[MAX_LIST][32];
 new Float:g_fProtAllowed[MAX_LIST];
 new g_iProtCount;
-new g_pc[CV_TOTAL];
-new Float:g_cv[CV_TOTAL];
+// Cvars: pointers and values cached once per second
+new g_pCvar[CV_TOTAL];
+new Float:g_fCv[CV_TOTAL];
+new g_iCv[CV_TOTAL];
 new g_pcBanCmd;
 new g_iWeightCv[DETECT_TOTAL];
+// Server state
 new g_hVault = INVALID_HANDLE;
+new g_iMaxPlayers;
+new g_szLogsDir[96];
 new g_iLastTick;
 new g_iTickMs = 1000;
 new bool:g_bHitch;
+new bool:g_bFreezeTime;
+new Float:g_fFreezeEnd;
+new Float:g_fFreezeMax;
+new g_pFreezeTime;
+// Player state
 new bool:g_bKicked[MAXP];
 new bool:g_bIgnore[MAXP];
 new bool:g_bWasAlive[MAXP];
 new bool:g_bLag[MAXP];
 new Float:g_fGraceUntil[MAXP];
+new Float:g_fSpeedLockUntil[MAXP];
 new Float:g_fDebugUntil[MAXP];
 new Float:g_fLastDump[MAXP];
 new Float:g_fLastAdminMsg[MAXP];
 new Float:g_fLogOnlyUntil[MAXP][DETECT_TOTAL];
 new g_szKey[MAXP][48];
+// Violation levels
 new Float:g_fVL[MAXP][DETECT_TOTAL];
 new Float:g_fMaxVL[MAXP][DETECT_TOTAL];
 new Float:g_fCooldown[MAXP][DETECT_TOTAL];
+// Counters of the current second
 new g_iMsec[MAXP];
 new g_iFrames[MAXP];
 new g_iClock[MAXP];
@@ -374,6 +471,7 @@ new g_iFrameNo[MAXP];
 new Float:g_fYawSum[MAXP];
 new g_iPitchCount[MAXP];
 new Float:g_fLastBadPitch[MAXP];
+// Per-second history
 new g_iSecMsec[MAXP][SEC_RING];
 new g_iSecReal[MAXP][SEC_RING];
 new g_iSecFrames[MAXP][SEC_RING];
@@ -382,10 +480,12 @@ new g_iSecPitch[MAXP][SEC_RING];
 new bool:g_bSecAlive[MAXP][SEC_RING];
 new bool:g_bSecLag[MAXP][SEC_RING];
 new g_iSecHead[MAXP];
+// Event streams
 new Float:g_fEvTime[MAXP][STREAMS][RING];
 new bool:g_bEvHit[MAXP][STREAMS][RING];
 new g_iEvHead[MAXP][STREAMS];
 new g_iEvFill[MAXP][STREAMS];
+// Last usercmd frames (debug snapshot)
 new g_iFrMove[MAXP][FRAMES];
 new g_iFrMsec[MAXP][FRAMES];
 new Float:g_fFrPitch[MAXP][FRAMES];
@@ -395,13 +495,16 @@ new Float:g_fFrS[MAXP][FRAMES];
 new g_iFrBtn[MAXP][FRAMES];
 new g_iFrHead[MAXP];
 new g_iFrFill[MAXP];
+// Cvar queries
 new g_iAnswered[MAXP];
 new g_iQueryFails[MAXP];
 new Float:g_fCl[MAXP][CL_TOTAL];
+// Settings verification
 new g_iVerifyLeft[MAXP][VERIFY_KINDS];
 new bool:g_bVerifyChanged[MAXP][VERIFY_KINDS];
 new Float:g_fVerifyMult[MAXP][VERIFY_KINDS];
 new g_szVerifyDetail[MAXP][VERIFY_KINDS][256];
+// Ground state and jump / duck buttons
 new g_iGroundFrames[MAXP];
 new g_iGroundMs[MAXP];
 new g_iAirMs[MAXP];
@@ -419,6 +522,12 @@ new bool:g_bBtnSampled[MAXP][2];
 new bool:g_bBtnPend[MAXP][2];
 new g_iBtnPendGround[MAXP][2];
 new g_iBtnPendAir[MAXP][2];
+// Move without keys: per axis (NK_FWD / NK_SIDE) the move sign that was
+// last backed by a held key, 0 = none
+#define NK_FWD            0
+#define NK_SIDE           1
+new g_iNkSign[MAXP][2];
+// View angle history (A = two frames ago, B = previous frame)
 new Float:g_fAngA[MAXP][2];
 new Float:g_fAngB[MAXP][2];
 new Float:g_fDeltaA[MAXP];
@@ -426,13 +535,18 @@ new Float:g_fDeltaB[MAXP];
 new g_iAngHist[MAXP];
 new g_iLastMsec[MAXP];
 new g_iLastMsecA[MAXP];
+// Strafe checks
 new g_iLastMouseDir[MAXP];
 new Float:g_fSegYaw[MAXP];
 new g_iLastSideDir[MAXP];
 new g_iLastSideSign[MAXP];
 new g_iHoldMs[MAXP];
+// Recoil, trigger and autofire
 new Float:g_fLastPunch[MAXP];
 new bool:g_bHasPunch[MAXP];
+// View kick from a hit / fall (GCD pause)
+new Float:g_fHitUntil[MAXP];
+new Float:g_fHitPunch[MAXP];
 new bool:g_bOnTarget[MAXP];
 new bool:g_bTargetIdle[MAXP];
 new g_iTargetStart[MAXP];
@@ -444,12 +558,13 @@ new g_iPrevIntFrames[MAXP];
 new g_iPrevHold[MAXP];
 new g_iAttackHold[MAXP];
 new g_iAttackLastHold[MAXP];
-new bool:g_bVisible[MAXP][MAXP];
+// Ping and aim error / move history (A and B as above)
 new g_iPing[MAXP];
 new Float:g_fErrA[MAXP];
 new Float:g_fErrB[MAXP];
 new Float:g_fMvA[MAXP][2];
 new Float:g_fMvB[MAXP][2];
+// Smooth aim
 new Float:g_fSmPrevMag[MAXP];
 new Float:g_fSmPrevDp[MAXP];
 new Float:g_fSmPrevDy[MAXP];
@@ -462,38 +577,49 @@ new Float:g_fSmKMax[MAXP];
 new g_iSmOn[MAXP];
 new g_iSmOff[MAXP];
 new Float:g_fSmStartErr[MAXP];
+// Player snapshot: alive / team cache and position history
 new Float:g_fRwLast;
+new bool:g_bAlive[MAXP];
+new g_iTeam[MAXP];
 new Float:g_fRwTime[MAXP][RW_SIZE];
 new Float:g_fRwOrg[MAXP][RW_SIZE][3];
 new bool:g_bRwDuck[MAXP][RW_SIZE];
 new g_iRwHead[MAXP];
 new g_iRwFill[MAXP];
-new Float:g_fVisTime[MAXP][MAXP];
+// Helpers
+// Registers a cvar and stores its pointer under the CV_* index.
 RegCvar(idx, const name[], const def[])
 {
-    g_pc[idx] = register_cvar(name, def);
+    g_pCvar[idx] = register_cvar(name, def);
 }
+// Reads every cvar once; the checks only use the cached values.
 CacheCvars()
 {
     for (new i = 0; i < CV_TOTAL; i++)
-        g_cv[i] = get_pcvar_float(g_pc[i]);
+    {
+        g_fCv[i] = get_pcvar_float(g_pCvar[i]);
+        g_iCv[i] = floatround(g_fCv[i]);
+    }
 }
 IntAbs(v)
 {
     return (v < 0) ? -v : v;
 }
+// Wraps an angle into [-180, 180]; garbage input becomes 9999.
 Float:NormalizeAngle(Float:a)
 {
     if (floatabs(a) > 100000.0)
         return 9999.0;
     return a - 360.0 * float(floatround(a / 360.0));
 }
+// Angular distance between two (pitch, yaw) pairs, degrees.
 Float:AngleDist(Float:p1, Float:y1, Float:p2, Float:y2)
 {
     new Float:dp = NormalizeAngle(p1 - p2);
     new Float:dy = NormalizeAngle(y1 - y2);
     return floatsqroot(dp * dp + dy * dy);
 }
+// Strafe direction of a side move: 1 = left, -1 = right, 0 = none.
 SideDir(Float:sidemove)
 {
     if (sidemove < 0.0)
@@ -510,6 +636,18 @@ bool:IsImmune(id)
 {
     return (CVI(CV_IMMUNITY) && (get_user_flags(id) & ADMIN_IMMUNITY));
 }
+// Eye position: origin + view offset.
+GetEye(id, Float:out[3])
+{
+    new Float:ofs[3];
+    pev(id, pev_origin, out);
+    pev(id, pev_view_ofs, ofs);
+    for (new i = 0; i < 3; i++)
+        out[i] += ofs[i];
+}
+// Logging and notifications
+// Writes a line to a log file. With ac_console 0 the file is written
+// directly, so the line is not echoed to the server console.
 LogFile(const file[], const fmt[], any:...)
 {
     new msg[512];
@@ -520,8 +658,7 @@ LogFile(const file[], const fmt[], any:...)
         return;
     }
     new path[128], date[32], line[560];
-    get_localinfo("amxx_logs", path, charsmax(path));
-    format(path, charsmax(path), "%s/%s", path, file);
+    formatex(path, charsmax(path), "%s/%s", g_szLogsDir, file);
     get_time("%m/%d/%Y - %H:%M:%S", date, charsmax(date));
     formatex(line, charsmax(line), "L %s: %s^n", date, msg);
     new f = fopen(path, "at");
@@ -531,6 +668,7 @@ LogFile(const file[], const fmt[], any:...)
         fclose(f);
     }
 }
+// One usercmd as text for the debug log.
 FormatFrame(out[], len, moveType, msec, Float:pitch, Float:yaw, Float:fmove, Float:smove, buttons)
 {
     new szMove[8];
@@ -550,6 +688,7 @@ FormatFrame(out[], len, moveType, msec, Float:pitch, Float:yaw, Float:fmove, Flo
         (buttons & IN_DUCK)      ? 'C' : '-',
         (buttons & IN_ATTACK)    ? 'F' : '-');
 }
+// Stores the usercmd in the per-player frame ring.
 RecordFrame(id, moveType, msec, Float:pitch, Float:yaw, Float:fmove, Float:smove, buttons)
 {
     new h = g_iFrHead[id];
@@ -564,6 +703,7 @@ RecordFrame(id, moveType, msec, Float:pitch, Float:yaw, Float:fmove, Float:smove
     if (g_iFrFill[id] < FRAMES)
         g_iFrFill[id]++;
 }
+// Dumps the last frames of a player to the debug log (once per second at most).
 DumpFrames(id, const prefix[])
 {
     if (!CVI(CV_SNAPSHOT) || g_iFrFill[id] == 0)
@@ -601,6 +741,7 @@ NotifyKick(id, flag, bool:ban)
     get_user_name(id, name, charsmax(name));
     client_print(0, print_chat, "[AC] %s %s: Detect #%d", name, ban ? "banned" : "kicked", flag);
 }
+// Chat message to online admins, rate limited per player.
 NotifyAdmins(id, const fmt[], any:...)
 {
     if (!CVI(CV_ADMIN_NOTIFY))
@@ -621,6 +762,8 @@ NotifyAdmins(id, const fmt[], any:...)
             client_print(admin, print_chat, "[AC] %s: %s", name, msg);
     }
 }
+// Punishment
+// Makes a string safe to pass into a server command.
 SafeCmdArg(str[])
 {
     for (new i = 0; str[i]; i++)
@@ -629,6 +772,7 @@ SafeCmdArg(str[])
             str[i] = '_';
     }
 }
+// Bans with ac_ban_cmd, or with banid / addip when the template is empty.
 BanPlayer(id, flag, const reason[])
 {
     new userid = get_user_userid(id);
@@ -679,6 +823,8 @@ public task_Kick(const param[], taskid)
         return;
     server_cmd("kick #%d ^"Detect #%d^"", param[0], param[1]);
 }
+// Kicks or bans according to ac_punish; immune players and log-only mode
+// are just logged. Returns true when the player was actually punished.
 bool:Punish(id, flag, const detail[])
 {
     if (g_bKicked[id])
@@ -714,6 +860,7 @@ bool:Punish(id, flag, const detail[])
         server_cmd("kick #%d ^"%s^"", get_user_userid(id), reason);
     return true;
 }
+// Adds the detection weight to the player VL and punishes at ac_vl_kick.
 AddViolation(id, flag, const detail[], Float:cooldown, Float:mult = 1.0)
 {
     if (g_bKicked[id] || g_iWeightCv[flag] < 0)
@@ -741,6 +888,8 @@ AddViolation(id, flag, const detail[], Float:cooldown, Float:mult = 1.0)
     DumpFrames(id, prefix);
     NotifyAdmins(id, "Warn #%d, VL %.0f/%.0f", flag, g_fVL[id][flag], kick);
 }
+// Violation level storage (nvault)
+// True when the authid identifies one player (not LAN, bot, pending...).
 bool:IsUniqueAuth(const auth[])
 {
     if (strlen(auth) < 8)
@@ -751,6 +900,7 @@ bool:IsUniqueAuth(const auth[])
         return false;
     return true;
 }
+// Vault key: authid when it is unique, IP otherwise.
 BuildKey(id)
 {
     new auth[35];
@@ -783,6 +933,7 @@ SaveVL(id)
     else
         nvault_remove(g_hVault, g_szKey[id]);
 }
+// Restores saved VL, minus the decay for the time spent offline.
 LoadVL(id)
 {
     if (g_hVault == INVALID_HANDLE || CVI(CV_REMEMBER) <= 0)
@@ -832,6 +983,7 @@ LoadVL(id)
     if (found)
         LogLine(id, "[Restore]", line);
 }
+// Event streams
 ClearStream(id, st)
 {
     g_iEvHead[id][st] = 0;
@@ -846,6 +998,7 @@ PushEvent(id, st, bool:hit)
     if (g_iEvFill[id][st] < RING)
         g_iEvFill[id][st]++;
 }
+// Counts events and hits that are not older than the window.
 CountStream(id, st, Float:window, &total, &hits)
 {
     total = 0;
@@ -860,6 +1013,7 @@ CountStream(id, st, Float:window, &total, &hits)
             hits++;
     }
 }
+// True when the stream has enough samples and the hit rate reaches percent.
 bool:StreamTriggered(id, st, Float:window, need, percent, &total, &hits, &pct)
 {
     if (need > RING)
@@ -873,6 +1027,7 @@ bool:StreamTriggered(id, st, Float:window, need, percent, &total, &hits, &pct)
     pct = hits * 100 / total;
     return (pct >= percent);
 }
+// VL multiplier that grows with the hit rate above the threshold.
 Float:ConfidenceMult(pct, percent)
 {
     new Float:scale = CVF(CV_VL_SCALE);
@@ -883,6 +1038,7 @@ Float:ConfidenceMult(pct, percent)
         m = 1.0 + scale;
     return m;
 }
+// Ratio based detection: fires when the hit rate of a stream is too high.
 bool:CheckStreamFlag(id, st, flag, need, percent, const what[], Float:window = 0.0, verify = -1)
 {
     if (window <= 0.0)
@@ -900,25 +1056,28 @@ bool:CheckStreamFlag(id, st, flag, need, percent, const what[], Float:window = 0
         AddViolation(id, flag, detail, 0.0, mult);
     return true;
 }
-VerifyFlag(kind)
+// Count based detection: fires after enough hits inside the window.
+bool:CountFlag(id, st, flag, need, Float:window, const what[], Float:mult = 1.0)
 {
-    if (kind == VERIFY_GCD)
-        return DETECT_GCD;
-    if (kind == VERIFY_SILENT)
-        return DETECT_SILENT;
-    return DETECT_VECTOR;
+    PushEvent(id, st, true);
+    new total, hits;
+    CountStream(id, st, window, total, hits);
+    if (need < 1)
+        need = 1;
+    if (hits < need)
+        return false;
+    new detail[224];
+    formatex(detail, charsmax(detail), "%s: %d in %.0f sec", what, hits, window);
+    ClearStream(id, st);
+    AddViolation(id, flag, detail, 0.0, mult);
+    return true;
 }
-VerifyStream(kind)
-{
-    if (kind == VERIFY_GCD)
-        return ST_GCD;
-    if (kind == VERIFY_SILENT)
-        return ST_SILENT_STRONG;
-    return ST_VECTOR;
-}
+// Client settings verification
+// Re-queries the client cvars a detection depends on. The detection is
+// applied only if the answers match the values it was calculated with.
 StartVerify(id, kind, const detail[], Float:mult)
 {
-    new flag = VerifyFlag(kind);
+    new flag = g_iVerifyFlag[kind];
     if (!CVI(CV_VERIFY) || !CVI(CV_QUERY))
     {
         if (kind == VERIFY_SILENT)
@@ -932,38 +1091,15 @@ StartVerify(id, kind, const detail[], Float:mult)
     copy(g_szVerifyDetail[id][kind], charsmax(g_szVerifyDetail[][]), detail);
     g_fVerifyMult[id][kind]    = mult;
     g_bVerifyChanged[id][kind] = false;
+    new first = g_iVerifyFirst[kind];
+    new last  = g_iVerifyLast[kind];
     new param[2];
     param[1] = kind + 1;
-    if (kind == VERIFY_GCD)
+    g_iVerifyLeft[id][kind] = last - first + 1;
+    for (new c = first; c <= last; c++)
     {
-        g_iVerifyLeft[id][kind] = 4;
-        param[0] = CL_SENS;
-        query_client_cvar(id, g_szClientCvars[CL_SENS], "cb_ClientCvar", 2, param);
-        param[0] = CL_MYAW;
-        query_client_cvar(id, g_szClientCvars[CL_MYAW], "cb_ClientCvar", 2, param);
-        param[0] = CL_MFILTER;
-        query_client_cvar(id, g_szClientCvars[CL_MFILTER], "cb_ClientCvar", 2, param);
-        param[0] = CL_MACCEL;
-        query_client_cvar(id, g_szClientCvars[CL_MACCEL], "cb_ClientCvar", 2, param);
-    }
-    else if (kind == VERIFY_SILENT)
-    {
-        g_iVerifyLeft[id][kind] = CL_MACCEL + 1;
-        for (new c = CL_FWD; c <= CL_MACCEL; c++)
-        {
-            param[0] = c;
-            query_client_cvar(id, g_szClientCvars[c], "cb_ClientCvar", 2, param);
-        }
-    }
-    else
-    {
-        g_iVerifyLeft[id][kind] = 3;
-        param[0] = CL_FWD;
-        query_client_cvar(id, g_szClientCvars[CL_FWD], "cb_ClientCvar", 2, param);
-        param[0] = CL_BACK;
-        query_client_cvar(id, g_szClientCvars[CL_BACK], "cb_ClientCvar", 2, param);
-        param[0] = CL_SIDE;
-        query_client_cvar(id, g_szClientCvars[CL_SIDE], "cb_ClientCvar", 2, param);
+        param[0] = c;
+        query_client_cvar(id, g_szClientCvars[c], "cb_ClientCvar", 2, param);
     }
     new taskid = TASK_VERIFY + kind * MAXP + id;
     remove_task(taskid);
@@ -972,12 +1108,12 @@ StartVerify(id, kind, const detail[], Float:mult)
 FinishVerify(id, kind)
 {
     remove_task(TASK_VERIFY + kind * MAXP + id);
-    new flag = VerifyFlag(kind);
+    new flag = g_iVerifyFlag[kind];
     if (g_bVerifyChanged[id][kind])
     {
         if (CVI(CV_LOG_WARN))
             LogLine(id, "[Verify]", "client settings changed, detection cancelled");
-        ClearStream(id, VerifyStream(kind));
+        ClearStream(id, g_iVerifyStream[kind]);
         return;
     }
     new detail[288];
@@ -1000,6 +1136,8 @@ public task_VerifyTimeout(taskid)
     if (is_user_connected(id) && CVI(CV_LOG_WARN))
         LogLine(id, "[Verify]", "no answer to settings re-check, detection dropped");
 }
+// Per-second statistics
+// Speed, spin and pitch statistics over the last secs seconds.
 SecStats(id, secs, speedLimit, Float:spinLimit, &speedBad, &spinBad, &pitchSum, &maxMsec, &sumMsec, &sumReal, &valid)
 {
     speedBad = 0;
@@ -1032,25 +1170,35 @@ SecStats(id, secs, speedLimit, Float:spinLimit, &speedBad, &spinBad, &pitchSum, 
         valid++;
     }
 }
+// Seconds with fps above the limit over the last secs seconds.
+// Usercmd msec is an integer, so at high fps it is rounded on every frame
+// and frames / msec can overestimate the real fps (fps_max 101 can look like
+// 111, 300 fps like 333...). The fps is therefore also measured against
+// the server real time of that second and the lower of the two is used:
+// a client really running above the limit is above it in both.
 FpsStats(id, secs, fpsMax, &bad, &maxFps)
 {
     bad    = 0;
     maxFps = 0;
     if (secs > SEC_RING)
         secs = SEC_RING;
-    new s, fps;
+    new s, fps, fpsReal;
     for (new i = 1; i <= secs; i++)
     {
         s = (g_iSecHead[id] - i + SEC_RING) % SEC_RING;
-        if (!g_bSecAlive[id][s] || g_bSecLag[id][s] || g_iSecMsec[id][s] < 500)
+        if (!g_bSecAlive[id][s] || g_bSecLag[id][s] || g_iSecMsec[id][s] < 500 || g_iSecReal[id][s] < 500)
             continue;
-        fps = g_iSecFrames[id][s] * 1000 / g_iSecMsec[id][s];
+        fps     = g_iSecFrames[id][s] * 1000 / g_iSecMsec[id][s];
+        fpsReal = g_iSecFrames[id][s] * 1000 / g_iSecReal[id][s];
+        if (fpsReal < fps)
+            fps = fpsReal;
         if (fps > maxFps)
             maxFps = fps;
         if (fps > fpsMax)
             bad++;
     }
 }
+// Plugin forwards
 public plugin_precache()
 {
     new mins[3], maxs[3];
@@ -1062,60 +1210,71 @@ public plugin_init()
     register_plugin(PLUGIN, VERSION, AUTHOR);
     register_cvar("simple_ac_version", VERSION, FCVAR_SERVER | FCVAR_SPONLY);
     set_cvar_string("simple_ac_version", VERSION);
-    RegCvar(CV_FIRST_CHECK,      "ac_first_check",        "10.0");
-    RegCvar(CV_INTERVAL,         "ac_check_interval",     "60.0");
-    RegCvar(CV_IMMUNITY,         "ac_immunity",           "0");
-    RegCvar(CV_NOTIFY,           "ac_notify",             "1");
-    RegCvar(CV_LOG_WARN,         "ac_log_warn",           "1");
-    RegCvar(CV_SNAPSHOT,         "ac_snapshot",           "1");
-    RegCvar(CV_CONSOLE,          "ac_console",            "0");
-    RegCvar(CV_WINDOW,           "ac_window",             "60.0");
-    RegCvar(CV_SEC_WINDOW,       "ac_sec_window",         "10");
-    RegCvar(CV_VL_KICK,          "ac_vl_kick",            "100");
-    RegCvar(CV_VL_DECAY,         "ac_vl_decay",           "3.0");
-    RegCvar(CV_VL_SCALE,         "ac_vl_scale",           "1.0");
-    RegCvar(CV_REMEMBER,         "ac_remember",           "30");
-    RegCvar(CV_VERIFY,           "ac_verify",             "1");
-    RegCvar(CV_LAG_PING,         "ac_lag_ping",           "200");
-    RegCvar(CV_LAG_LOSS,         "ac_lag_loss",           "5");
-    RegCvar(CV_SPEED,            "ac_speed",              "1");
-    RegCvar(CV_SPEED_LIMIT,      "ac_speed_limit",        "1200");
-    RegCvar(CV_SPEED_RATIO,      "ac_speed_ratio",        "1.10");
-    RegCvar(CV_SPEED_WARNS,      "ac_speed_warns",        "4");
-    RegCvar(CV_SPEED_VL,         "ac_speed_vl",           "60");
-    RegCvar(CV_QUERY,            "ac_query",              "1");
-    RegCvar(CV_QUERY_TIMEOUT,    "ac_query_timeout",      "15.0");
-    RegCvar(CV_QUERY_FAILS,      "ac_query_fails",        "2");
-    RegCvar(CV_JUMP_WINDOW,        "ac_jump_window",        "180.0");
-    RegCvar(CV_BHOP,               "ac_bhop",               "1");
-    RegCvar(CV_BHOP_JUMPS,         "ac_bhop_jumps",         "25");
-    RegCvar(CV_BHOP_PERCENT,       "ac_bhop_percent",       "90");
-    RegCvar(CV_BHOP_EXACT_JUMPS,   "ac_bhop_exact_jumps",   "12");
-    RegCvar(CV_BHOP_EXACT_PERCENT, "ac_bhop_exact_percent", "75");
-    RegCvar(CV_BHOP_TAP_JUMPS,     "ac_bhop_tap_jumps",     "15");
-    RegCvar(CV_BHOP_TAP_PERCENT,   "ac_bhop_tap_percent",   "90");
-    RegCvar(CV_BHOP_SPAM_JUMPS,    "ac_bhop_spam_jumps",    "10");
-    RegCvar(CV_BHOP_SPAM_PERCENT,  "ac_bhop_spam_percent",  "80");
-    RegCvar(CV_BHOP_VL,            "ac_bhop_vl",            "55");
-    RegCvar(CV_PITCH,            "ac_pitch",              "1");
-    RegCvar(CV_PITCH_LIMIT,      "ac_pitch_limit",        "89.5");
-    RegCvar(CV_PITCH_WARNS,      "ac_pitch_warns",        "20");
-    RegCvar(CV_SPIN,             "ac_spin",               "1");
-    RegCvar(CV_SPIN_LIMIT,       "ac_spin_limit",         "2880");
-    RegCvar(CV_SPIN_WARNS,       "ac_spin_warns",         "3");
-    RegCvar(CV_SPIN_VL,          "ac_spin_vl",            "60");
-    RegCvar(CV_SNAP,             "ac_snap",               "1");
-    RegCvar(CV_SNAP_ANGLE,       "ac_snap_angle",         "10.0");
-    RegCvar(CV_SNAP_RATIO,       "ac_snap_ratio",         "6.0");
-    RegCvar(CV_SNAP_FOV,         "ac_snap_fov",           "3.0");
-    RegCvar(CV_SNAP_COUNT,       "ac_snap_count",         "3");
-    RegCvar(CV_SNAP_WINDOW,      "ac_snap_window",        "120.0");
-    RegCvar(CV_SNAP_VL,          "ac_snap_vl",            "60");
-    RegCvar(CV_STRAFE,           "ac_strafe",             "1");
-    RegCvar(CV_STRAFE_SAMPLES,   "ac_strafe_samples",     "40");
-    RegCvar(CV_STRAFE_PERCENT,   "ac_strafe_percent",     "80");
-    RegCvar(CV_STRAFE_MINTURN,   "ac_strafe_minturn",     "1.0");
-    RegCvar(CV_STRAFE_VL,        "ac_strafe_vl",          "40");
+    // General
+    RegCvar(CV_FIRST_CHECK,           "ac_first_check",           "10.0");
+    RegCvar(CV_INTERVAL,              "ac_check_interval",        "60.0");
+    RegCvar(CV_IMMUNITY,              "ac_immunity",              "0");
+    RegCvar(CV_NOTIFY,                "ac_notify",                "1");
+    RegCvar(CV_LOG_WARN,              "ac_log_warn",              "1");
+    RegCvar(CV_SNAPSHOT,              "ac_snapshot",              "1");
+    RegCvar(CV_CONSOLE,               "ac_console",               "0");
+    RegCvar(CV_WINDOW,                "ac_window",                "60.0");
+    RegCvar(CV_SEC_WINDOW,            "ac_sec_window",            "10");
+    // Violation levels
+    RegCvar(CV_VL_KICK,               "ac_vl_kick",               "100");
+    RegCvar(CV_VL_DECAY,              "ac_vl_decay",              "3.0");
+    RegCvar(CV_VL_SCALE,              "ac_vl_scale",              "1.0");
+    RegCvar(CV_REMEMBER,              "ac_remember",              "30");
+    RegCvar(CV_VERIFY,                "ac_verify",                "1");
+    // Lag tolerance
+    RegCvar(CV_LAG_PING,              "ac_lag_ping",              "200");
+    RegCvar(CV_LAG_LOSS,              "ac_lag_loss",              "5");
+    // Speedhack
+    RegCvar(CV_SPEED,                 "ac_speed",                 "1");
+    RegCvar(CV_SPEED_LIMIT,           "ac_speed_limit",           "1200");
+    RegCvar(CV_SPEED_RATIO,           "ac_speed_ratio",           "1.10");
+    RegCvar(CV_SPEED_WARNS,           "ac_speed_warns",           "4");
+    RegCvar(CV_SPEED_VL,              "ac_speed_vl",              "60");
+    // Cvar query blocking
+    RegCvar(CV_QUERY,                 "ac_query",                 "1");
+    RegCvar(CV_QUERY_TIMEOUT,         "ac_query_timeout",         "15.0");
+    RegCvar(CV_QUERY_FAILS,           "ac_query_fails",           "2");
+    // Bhop scripts
+    RegCvar(CV_JUMP_WINDOW,           "ac_jump_window",           "180.0");
+    RegCvar(CV_BHOP,                  "ac_bhop",                  "1");
+    RegCvar(CV_BHOP_JUMPS,            "ac_bhop_jumps",            "25");
+    RegCvar(CV_BHOP_PERCENT,          "ac_bhop_percent",          "90");
+    RegCvar(CV_BHOP_EXACT_JUMPS,      "ac_bhop_exact_jumps",      "12");
+    RegCvar(CV_BHOP_EXACT_PERCENT,    "ac_bhop_exact_percent",    "75");
+    RegCvar(CV_BHOP_TAP_JUMPS,        "ac_bhop_tap_jumps",        "15");
+    RegCvar(CV_BHOP_TAP_PERCENT,      "ac_bhop_tap_percent",      "90");
+    RegCvar(CV_BHOP_SPAM_JUMPS,       "ac_bhop_spam_jumps",       "10");
+    RegCvar(CV_BHOP_SPAM_PERCENT,     "ac_bhop_spam_percent",     "80");
+    RegCvar(CV_BHOP_VL,               "ac_bhop_vl",               "55");
+    // Invalid pitch
+    RegCvar(CV_PITCH,                 "ac_pitch",                 "1");
+    RegCvar(CV_PITCH_LIMIT,           "ac_pitch_limit",           "89.5");
+    RegCvar(CV_PITCH_WARNS,           "ac_pitch_warns",           "20");
+    // Spinbot
+    RegCvar(CV_SPIN,                  "ac_spin",                  "1");
+    RegCvar(CV_SPIN_LIMIT,            "ac_spin_limit",            "2880");
+    RegCvar(CV_SPIN_WARNS,            "ac_spin_warns",            "3");
+    RegCvar(CV_SPIN_VL,               "ac_spin_vl",               "60");
+    // Aim snap
+    RegCvar(CV_SNAP,                  "ac_snap",                  "1");
+    RegCvar(CV_SNAP_ANGLE,            "ac_snap_angle",            "10.0");
+    RegCvar(CV_SNAP_RATIO,            "ac_snap_ratio",            "6.0");
+    RegCvar(CV_SNAP_FOV,              "ac_snap_fov",              "3.0");
+    RegCvar(CV_SNAP_COUNT,            "ac_snap_count",            "3");
+    RegCvar(CV_SNAP_WINDOW,           "ac_snap_window",           "120.0");
+    RegCvar(CV_SNAP_VL,               "ac_snap_vl",               "60");
+    // Strafe helper
+    RegCvar(CV_STRAFE,                "ac_strafe",                "1");
+    RegCvar(CV_STRAFE_SAMPLES,        "ac_strafe_samples",        "40");
+    RegCvar(CV_STRAFE_PERCENT,        "ac_strafe_percent",        "80");
+    RegCvar(CV_STRAFE_MINTURN,        "ac_strafe_minturn",        "1.0");
+    RegCvar(CV_STRAFE_VL,             "ac_strafe_vl",             "40");
+    // Duck scripts (dd / gstrafe)
     RegCvar(CV_GSTRAFE,               "ac_gstrafe",               "1");
     RegCvar(CV_GSTRAFE_DUCKS,         "ac_gstrafe_ducks",         "25");
     RegCvar(CV_GSTRAFE_PERCENT,       "ac_gstrafe_percent",       "90");
@@ -1126,80 +1285,95 @@ public plugin_init()
     RegCvar(CV_GSTRAFE_SPAM_DUCKS,    "ac_gstrafe_spam_ducks",    "10");
     RegCvar(CV_GSTRAFE_SPAM_PERCENT,  "ac_gstrafe_spam_percent",  "80");
     RegCvar(CV_GSTRAFE_VL,            "ac_gstrafe_vl",            "55");
-    RegCvar(CV_NOKEYS,           "ac_nokeys",             "1");
-    RegCvar(CV_NOKEYS_SAMPLES,   "ac_nokeys_samples",     "50");
-    RegCvar(CV_NOKEYS_PERCENT,   "ac_nokeys_percent",     "60");
-    RegCvar(CV_NOKEYS_VL,        "ac_nokeys_vl",          "60");
-    RegCvar(CV_VECTOR,           "ac_vector",             "1");
-    RegCvar(CV_VECTOR_SAMPLES,   "ac_vector_samples",     "40");
-    RegCvar(CV_VECTOR_PERCENT,   "ac_vector_percent",     "70");
-    RegCvar(CV_VECTOR_VL,        "ac_vector_vl",          "60");
-    RegCvar(CV_FS,               "ac_faststrafe",         "1");
-    RegCvar(CV_FS_MS,            "ac_faststrafe_ms",      "20");
-    RegCvar(CV_FS_SAMPLES,       "ac_faststrafe_samples", "20");
-    RegCvar(CV_FS_PERCENT,       "ac_faststrafe_percent", "60");
-    RegCvar(CV_FS_VL,            "ac_faststrafe_vl",      "60");
-    RegCvar(CV_TRAP,             "ac_trap",               "1");
-    RegCvar(CV_GCD,              "ac_gcd",                "1");
-    RegCvar(CV_GCD_SAMPLES,      "ac_gcd_samples",        "40");
-    RegCvar(CV_GCD_PERCENT,      "ac_gcd_percent",        "30");
-    RegCvar(CV_GCD_VL,           "ac_gcd_vl",             "50");
-    RegCvar(CV_GCD_CONTEXT,      "ac_gcd_context",        "1");
-    RegCvar(CV_GCD_FOV,          "ac_gcd_fov",            "10.0");
-    RegCvar(CV_RECOIL,           "ac_norecoil",           "1");
-    RegCvar(CV_RECOIL_SAMPLES,   "ac_norecoil_samples",   "30");
-    RegCvar(CV_RECOIL_PERCENT,   "ac_norecoil_percent",   "80");
-    RegCvar(CV_RECOIL_VL,        "ac_norecoil_vl",        "60");
-    RegCvar(CV_TRIGGER,          "ac_trigger",            "1");
-    RegCvar(CV_TRIGGER_MS,       "ac_trigger_ms",         "50");
-    RegCvar(CV_TRIGGER_IDLE,     "ac_trigger_idle",       "250");
-    RegCvar(CV_TRIGGER_STILL,    "ac_trigger_still",      "1.5");
-    RegCvar(CV_TRIGGER_SAMPLES,  "ac_trigger_samples",    "15");
-    RegCvar(CV_TRIGGER_PERCENT,  "ac_trigger_percent",    "70");
-    RegCvar(CV_TRIGGER_VL,       "ac_trigger_vl",         "60");
-    RegCvar(CV_AUTOFIRE,         "ac_autofire",           "1");
-    RegCvar(CV_AUTOFIRE_SAMPLES, "ac_autofire_samples",   "20");
-    RegCvar(CV_AUTOFIRE_PERCENT, "ac_autofire_percent",   "80");
-    RegCvar(CV_AUTOFIRE_VL,      "ac_autofire_vl",        "60");
-    RegCvar(CV_FPS,              "ac_fps",                "1");
-    RegCvar(CV_FPS_MAX,          "ac_fps_max",            "105");
-    RegCvar(CV_FPS_WARNS,        "ac_fps_warns",          "5");
-    RegCvar(CV_FPS_VL,           "ac_fps_vl",             "50");
-    RegCvar(CV_REWIND,           "ac_rewind",             "1");
-    RegCvar(CV_HIT_RADIUS,       "ac_hit_radius",         "12.0");
-    RegCvar(CV_AIM_TARGET,       "ac_aim_target",         "1");
-    RegCvar(CV_SILENT,           "ac_silent",             "1");
-    RegCvar(CV_SILENT_ANGLE,     "ac_silent_angle",       "3.0");
-    RegCvar(CV_SILENT_MIN,       "ac_silent_min",         "0.3");
-    RegCvar(CV_SILENT_RETURN,    "ac_silent_return",      "0.35");
-    RegCvar(CV_SILENT_FOV,       "ac_silent_fov",         "8.0");
-    RegCvar(CV_SILENT_COUNT,     "ac_silent_count",       "4");
-    RegCvar(CV_SILENT_WINDOW,    "ac_silent_window",      "120.0");
-    RegCvar(CV_SILENT_VL,        "ac_silent_vl",          "60");
-    RegCvar(CV_SILENT_INSTANT,   "ac_silent_instant",     "1");
-    RegCvar(CV_SILENT_EXACT,     "ac_silent_exact",       "0.1");
-    RegCvar(CV_SILENT_FOCUS,     "ac_silent_focus",       "0.5");
-    RegCvar(CV_SILENT_MSEC,      "ac_silent_msec",        "16");
-    RegCvar(CV_SMOOTH,           "ac_smooth",             "1");
-    RegCvar(CV_SMOOTH_FRAMES,    "ac_smooth_frames",      "4");
-    RegCvar(CV_SMOOTH_TOL,       "ac_smooth_tol",         "0.03");
-    RegCvar(CV_SMOOTH_FOV,       "ac_smooth_fov",         "3.0");
-    RegCvar(CV_SMOOTH_COUNT,     "ac_smooth_count",       "5");
-    RegCvar(CV_SMOOTH_WINDOW,    "ac_smooth_window",      "180.0");
-    RegCvar(CV_SMOOTH_VL,        "ac_smooth_vl",          "50");
-    RegCvar(CV_HS,               "ac_hs",                 "1");
-    RegCvar(CV_HS_KILLS,         "ac_hs_kills",           "25");
-    RegCvar(CV_HS_PERCENT,       "ac_hs_percent",         "85");
-    RegCvar(CV_HS_WINDOW,        "ac_hs_window",          "900.0");
-    RegCvar(CV_HS_VL,            "ac_hs_vl",              "35");
-    RegCvar(CV_AUTOSTOP,         "ac_autostop",           "1");
-    RegCvar(CV_AUTOSTOP_COUNT,   "ac_autostop_count",     "10");
-    RegCvar(CV_AUTOSTOP_WINDOW,  "ac_autostop_window",    "60.0");
-    RegCvar(CV_AUTOSTOP_VL,      "ac_autostop_vl",        "60");
-    RegCvar(CV_ANTIWH,           "ac_antiwh",             "1");
-    RegCvar(CV_PUNISH,           "ac_punish",             "1");
-    RegCvar(CV_BAN_TIME,         "ac_ban_time",           "1440");
-    RegCvar(CV_ADMIN_NOTIFY,     "ac_admin_notify",       "1");
+    // Move without keys
+    RegCvar(CV_NOKEYS,                "ac_nokeys",                "1");
+    RegCvar(CV_NOKEYS_SAMPLES,        "ac_nokeys_samples",        "50");
+    RegCvar(CV_NOKEYS_PERCENT,        "ac_nokeys_percent",        "60");
+    RegCvar(CV_NOKEYS_VL,             "ac_nokeys_vl",             "60");
+    // Rotated move vector
+    RegCvar(CV_VECTOR,                "ac_vector",                "1");
+    RegCvar(CV_VECTOR_SAMPLES,        "ac_vector_samples",        "40");
+    RegCvar(CV_VECTOR_PERCENT,        "ac_vector_percent",        "70");
+    RegCvar(CV_VECTOR_VL,             "ac_vector_vl",             "60");
+    // Fast strafe switch
+    RegCvar(CV_FS,                    "ac_faststrafe",            "1");
+    RegCvar(CV_FS_MS,                 "ac_faststrafe_ms",         "20");
+    RegCvar(CV_FS_SAMPLES,            "ac_faststrafe_samples",    "20");
+    RegCvar(CV_FS_PERCENT,            "ac_faststrafe_percent",    "60");
+    RegCvar(CV_FS_VL,                 "ac_faststrafe_vl",         "60");
+    // Trap cvar
+    RegCvar(CV_TRAP,                  "ac_trap",                  "1");
+    // Mouse step (GCD)
+    RegCvar(CV_GCD,                   "ac_gcd",                   "1");
+    RegCvar(CV_GCD_SAMPLES,           "ac_gcd_samples",           "40");
+    RegCvar(CV_GCD_PERCENT,           "ac_gcd_percent",           "30");
+    RegCvar(CV_GCD_VL,                "ac_gcd_vl",                "50");
+    RegCvar(CV_GCD_CONTEXT,           "ac_gcd_context",           "1");
+    RegCvar(CV_GCD_FOV,               "ac_gcd_fov",               "10.0");
+    RegCvar(CV_GCD_HIT,               "ac_gcd_hit",               "1.0");
+    // No-recoil
+    RegCvar(CV_RECOIL,                "ac_norecoil",              "1");
+    RegCvar(CV_RECOIL_SAMPLES,        "ac_norecoil_samples",      "30");
+    RegCvar(CV_RECOIL_PERCENT,        "ac_norecoil_percent",      "80");
+    RegCvar(CV_RECOIL_VL,             "ac_norecoil_vl",           "60");
+    // Triggerbot
+    RegCvar(CV_TRIGGER,               "ac_trigger",               "1");
+    RegCvar(CV_TRIGGER_MS,            "ac_trigger_ms",            "50");
+    RegCvar(CV_TRIGGER_IDLE,          "ac_trigger_idle",          "250");
+    RegCvar(CV_TRIGGER_STILL,         "ac_trigger_still",         "1.5");
+    RegCvar(CV_TRIGGER_SAMPLES,       "ac_trigger_samples",       "15");
+    RegCvar(CV_TRIGGER_PERCENT,       "ac_trigger_percent",       "70");
+    RegCvar(CV_TRIGGER_VL,            "ac_trigger_vl",            "60");
+    // Autofire
+    RegCvar(CV_AUTOFIRE,              "ac_autofire",              "1");
+    RegCvar(CV_AUTOFIRE_SAMPLES,      "ac_autofire_samples",      "20");
+    RegCvar(CV_AUTOFIRE_PERCENT,      "ac_autofire_percent",      "80");
+    RegCvar(CV_AUTOFIRE_VL,           "ac_autofire_vl",           "60");
+    // Fps limit
+    RegCvar(CV_FPS,                   "ac_fps",                   "1");
+    RegCvar(CV_FPS_MAX,               "ac_fps_max",               "1000");
+    RegCvar(CV_FPS_WARNS,             "ac_fps_warns",             "5");
+    RegCvar(CV_FPS_VL,                "ac_fps_vl",                "50");
+    // Aim target search
+    RegCvar(CV_REWIND,                "ac_rewind",                "1");
+    RegCvar(CV_HIT_RADIUS,            "ac_hit_radius",            "12.0");
+    RegCvar(CV_AIM_TARGET,            "ac_aim_target",            "1");
+    // Silent aim
+    RegCvar(CV_SILENT,                "ac_silent",                "1");
+    RegCvar(CV_SILENT_ANGLE,          "ac_silent_angle",          "3.0");
+    RegCvar(CV_SILENT_MIN,            "ac_silent_min",            "0.3");
+    RegCvar(CV_SILENT_RETURN,         "ac_silent_return",         "0.35");
+    RegCvar(CV_SILENT_FOV,            "ac_silent_fov",            "8.0");
+    RegCvar(CV_SILENT_COUNT,          "ac_silent_count",          "4");
+    RegCvar(CV_SILENT_WINDOW,         "ac_silent_window",         "120.0");
+    RegCvar(CV_SILENT_VL,             "ac_silent_vl",             "60");
+    RegCvar(CV_SILENT_INSTANT,        "ac_silent_instant",        "1");
+    RegCvar(CV_SILENT_EXACT,          "ac_silent_exact",          "0.1");
+    RegCvar(CV_SILENT_FOCUS,          "ac_silent_focus",          "0.5");
+    RegCvar(CV_SILENT_MSEC,           "ac_silent_msec",           "16");
+    // Smooth aim
+    RegCvar(CV_SMOOTH,                "ac_smooth",                "1");
+    RegCvar(CV_SMOOTH_FRAMES,         "ac_smooth_frames",         "4");
+    RegCvar(CV_SMOOTH_TOL,            "ac_smooth_tol",            "0.03");
+    RegCvar(CV_SMOOTH_FOV,            "ac_smooth_fov",            "3.0");
+    RegCvar(CV_SMOOTH_COUNT,          "ac_smooth_count",          "5");
+    RegCvar(CV_SMOOTH_WINDOW,         "ac_smooth_window",         "180.0");
+    RegCvar(CV_SMOOTH_VL,             "ac_smooth_vl",             "50");
+    // Headshot ratio
+    RegCvar(CV_HS,                    "ac_hs",                    "1");
+    RegCvar(CV_HS_KILLS,              "ac_hs_kills",              "25");
+    RegCvar(CV_HS_PERCENT,            "ac_hs_percent",            "85");
+    RegCvar(CV_HS_WINDOW,             "ac_hs_window",             "900.0");
+    RegCvar(CV_HS_VL,                 "ac_hs_vl",                 "35");
+    // Autostop
+    RegCvar(CV_AUTOSTOP,              "ac_autostop",              "1");
+    RegCvar(CV_AUTOSTOP_COUNT,        "ac_autostop_count",        "10");
+    RegCvar(CV_AUTOSTOP_WINDOW,       "ac_autostop_window",       "60.0");
+    RegCvar(CV_AUTOSTOP_VL,           "ac_autostop_vl",           "60");
+    // Punishment
+    RegCvar(CV_PUNISH,                "ac_punish",                "1");
+    RegCvar(CV_BAN_TIME,              "ac_ban_time",              "1440");
+    RegCvar(CV_ADMIN_NOTIFY,          "ac_admin_notify",          "1");
     g_pcBanCmd = register_cvar("ac_ban_cmd", "");
     for (new f = 0; f < DETECT_TOTAL; f++)
         g_iWeightCv[f] = -1;
@@ -1225,11 +1399,15 @@ public plugin_init()
     register_concmd("amx_acdebug", "cmd_Debug", ADMIN_RCON, "<name|#userid> [seconds]");
     register_concmd("amx_acreset", "cmd_Reset", ADMIN_RCON, "<name|#userid> - clear VL and samples");
     register_forward(FM_CmdStart, "fw_CmdStart");
-    register_forward(FM_AddToFullPack, "fw_AddToFullPack", 0);
     register_forward(FM_StartFrame, "fw_StartFrame");
     register_event("HLTV", "ev_NewRound", "a", "1=0", "2=0");
+    register_logevent("ev_RoundStart", 2, "1=Round_Start");
+    g_pFreezeTime = get_cvar_pointer("mp_freezetime");
     register_event("DeathMsg", "ev_Death", "a");
-    g_hVault = nvault_open(VAULT_NAME);
+    register_event("Damage", "ev_Damage", "be", "2!0");
+    g_hVault      = nvault_open(VAULT_NAME);
+    g_iMaxPlayers = get_maxplayers();
+    get_localinfo("amxx_logs", g_szLogsDir, charsmax(g_szLogsDir));
     CacheCvars();
     g_iLastTick = tickcount();
     set_task(1.0, "task_SecondCheck", TASK_SECOND, _, _, "b");
@@ -1255,6 +1433,19 @@ public plugin_cfg()
         nvault_prune(g_hVault, 0, get_systime() - keep);
     }
 }
+public plugin_end()
+{
+    if (g_hVault == INVALID_HANDLE)
+        return;
+    for (new id = 1; id <= g_iMaxPlayers; id++)
+    {
+        if (is_user_connected(id) && !g_bIgnore[id])
+            SaveVL(id);
+    }
+    nvault_close(g_hVault);
+    g_hVault = INVALID_HANDLE;
+}
+// Cvar lists (simple_anticheat.ini)
 AddCheatCvar(const name[])
 {
     if (g_iCheatCount >= MAX_LIST || !name[0])
@@ -1270,6 +1461,7 @@ AddProtCvar(const name[], Float:allowed)
     g_fProtAllowed[g_iProtCount] = allowed;
     g_iProtCount++;
 }
+// Loads the cheat / protected cvar lists, or the defaults without the file.
 LoadLists(const path[])
 {
     g_iCheatCount = 0;
@@ -1308,18 +1500,7 @@ LoadLists(const path[])
     }
     fclose(f);
 }
-public plugin_end()
-{
-    if (g_hVault == INVALID_HANDLE)
-        return;
-    for (new id = 1; id < MAXP; id++)
-    {
-        if (is_user_connected(id) && !g_bIgnore[id])
-            SaveVL(id);
-    }
-    nvault_close(g_hVault);
-    g_hVault = INVALID_HANDLE;
-}
+// Player state
 ResetButtons(id)
 {
     for (new b = 0; b < 2; b++)
@@ -1336,11 +1517,31 @@ ResetButtons(id)
         g_bBtnPend[id][b]       = false;
         g_iBtnPendGround[id][b] = 0;
         g_iBtnPendAir[id][b]    = 0;
+        g_iNkSign[id][b]        = 0;
     }
     g_iGroundFrames[id] = 0;
     g_iGroundMs[id]     = 0;
     g_iAirMs[id]        = 0;
     g_iLastAirMs[id]    = 0;
+}
+ResetAim(id)
+{
+    g_fErrA[id] = AIM_NONE;
+    g_fErrB[id] = AIM_NONE;
+    for (new i = 0; i < 2; i++)
+    {
+        g_fMvA[id][i] = 0.0;
+        g_fMvB[id][i] = 0.0;
+    }
+    g_fSmPrevMag[id] = 0.0;
+    g_fSmPrevDp[id]  = 0.0;
+    g_fSmPrevDy[id]  = 0.0;
+    g_fSmK[id]       = 0.0;
+    g_fSmT[id]       = 0.0;
+    g_bSmHaveK[id]   = false;
+    g_iSmRun[id]     = 0;
+    g_iSmOn[id]      = 0;
+    g_iSmOff[id]     = 0;
 }
 ResetPlayer(id)
 {
@@ -1386,6 +1587,8 @@ ResetPlayer(id)
     g_iHoldMs[id]       = 0;
     g_fLastPunch[id]    = 0.0;
     g_bHasPunch[id]     = false;
+    g_fHitUntil[id]     = 0.0;
+    g_fHitPunch[id]     = 0.0;
     g_bOnTarget[id]     = false;
     g_bTargetIdle[id]   = false;
     g_iTargetStart[id]  = 0;
@@ -1400,8 +1603,11 @@ ResetPlayer(id)
     g_iFrHead[id] = 0;
     g_iFrFill[id] = 0;
     g_iPing[id]   = 0;
+    g_fSpeedLockUntil[id] = 0.0;
     g_iRwHead[id] = 0;
     g_iRwFill[id] = 0;
+    g_bAlive[id]  = false;
+    g_iTeam[id]   = 0;
     ResetAim(id);
     for (new f = 0; f < DETECT_TOTAL; f++)
     {
@@ -1423,33 +1629,8 @@ ResetPlayer(id)
     g_iSecHead[id] = 0;
     for (new st = 0; st < STREAMS; st++)
         ClearStream(id, st);
-    for (new p = 0; p < MAXP; p++)
-    {
-        g_bVisible[id][p] = true;
-        g_bVisible[p][id] = true;
-        g_fVisTime[id][p] = 0.0;
-        g_fVisTime[p][id] = 0.0;
-    }
 }
-ResetAim(id)
-{
-    g_fErrA[id] = AIM_NONE;
-    g_fErrB[id] = AIM_NONE;
-    for (new i = 0; i < 2; i++)
-    {
-        g_fMvA[id][i] = 0.0;
-        g_fMvB[id][i] = 0.0;
-    }
-    g_fSmPrevMag[id] = 0.0;
-    g_fSmPrevDp[id]  = 0.0;
-    g_fSmPrevDy[id]  = 0.0;
-    g_fSmK[id]       = 0.0;
-    g_fSmT[id]       = 0.0;
-    g_bSmHaveK[id]   = false;
-    g_iSmRun[id]     = 0;
-    g_iSmOn[id]      = 0;
-    g_iSmOff[id]     = 0;
-}
+// Logs the highest VL the player reached during the session.
 LogSession(id)
 {
     new line[192], len;
@@ -1466,6 +1647,7 @@ LogSession(id)
     if (found)
         LogLine(id, "[Session]", line);
 }
+// Client forwards
 public client_connect(id)
 {
     ResetPlayer(id);
@@ -1504,18 +1686,39 @@ public client_disconnected(id)
     }
     ResetPlayer(id);
 }
+// Game events
 public ev_NewRound()
 {
+    // Freezetime (buy time) starts with the new round.
+    // If Round_Start is never logged, the freeze ends after mp_freezetime.
+    g_bFreezeTime = true;
+    g_fFreezeMax  = get_gametime() + (g_pFreezeTime ? get_pcvar_float(g_pFreezeTime) : 0.0) + 2.0;
     new Float:until = get_gametime() + SPAWN_GRACE;
-    for (new id = 1; id < MAXP; id++)
+    for (new id = 1; id <= g_iMaxPlayers; id++)
     {
         g_fGraceUntil[id] = until;
         g_iAngHist[id]    = 0;
         g_bHasPunch[id]   = false;
+        g_fHitUntil[id]   = 0.0;
+        g_fHitPunch[id]   = 0.0;
         g_iRwFill[id]     = 0;
         ResetAim(id);
     }
 }
+// Freezetime is over, players can move.
+public ev_RoundStart()
+{
+    g_bFreezeTime = false;
+    g_fFreezeEnd  = get_gametime();
+}
+// The player was hurt: the client is about to kick the view (punch angle).
+public ev_Damage(id)
+{
+    if (id < 1 || id >= MAXP || CVF(CV_GCD_HIT) <= 0.0)
+        return;
+    HitGrace(id, get_gametime());
+}
+// Headshot ratio over enemy kills with firearms.
 public ev_Death()
 {
     if (!CVI(CV_HS))
@@ -1538,6 +1741,8 @@ public ev_Death()
         CheckStreamFlag(killer, ST_HS, DETECT_HEADSHOT, CVI(CV_HS_KILLS), CVI(CV_HS_PERCENT),
             "headshot ratio, kills", CVF(CV_HS_WINDOW));
 }
+// Client cvar checks
+// Queries cheat, protected and settings cvars plus one random fake cvar.
 public task_CvarCheck(taskid)
 {
     new id = taskid - TASK_CHECK;
@@ -1583,6 +1788,7 @@ public task_CvarCheck(taskid)
         next = minNext;
     set_task(next, "task_CvarCheck", taskid);
 }
+// A cvar that exists only in cheats was answered.
 public cb_CheatCvar(id, const cvar[], const value[], const param[])
 {
     if (!is_user_connected(id))
@@ -1594,6 +1800,7 @@ public cb_CheatCvar(id, const cvar[], const value[], const param[])
     formatex(detail, charsmax(detail), "cheat cvar ^"%s^" = ^"%s^"", cvar, value);
     Punish(id, DETECT_CHEAT_CVAR, detail);
 }
+// A protected cvar must keep its allowed value.
 public cb_ProtCvar(id, const cvar[], const value[], const param[])
 {
     if (!is_user_connected(id))
@@ -1611,6 +1818,7 @@ public cb_ProtCvar(id, const cvar[], const value[], const param[])
         Punish(id, DETECT_BAD_VALUE, detail);
     }
 }
+// Stores client settings and feeds pending verifications.
 public cb_ClientCvar(id, const cvar[], const value[], const param[])
 {
     if (!is_user_connected(id))
@@ -1658,6 +1866,7 @@ public cb_ClientCvar(id, const cvar[], const value[], const param[])
             FinishVerify(id, kind);
     }
 }
+// A cvar that cannot exist was answered: the query is being spoofed.
 public cb_Trap(id, const cvar[], const value[], const param[])
 {
     if (!is_user_connected(id))
@@ -1669,6 +1878,7 @@ public cb_Trap(id, const cvar[], const value[], const param[])
     formatex(detail, charsmax(detail), "fake cvar ^"%s^" answered ^"%s^"", cvar, value);
     Punish(id, DETECT_TRAP, detail);
 }
+// No answers at all: the client blocks cvar queries.
 public task_QueryTimeout(taskid)
 {
     new id = taskid - TASK_QUERY;
@@ -1714,6 +1924,8 @@ public inconsistent_file(id, const filename[], reason[64])
         BanPlayer(id, DETECT_FILE, reason);
     return PLUGIN_CONTINUE;
 }
+// Movement checks
+// Tracks ground / air time and returns MOVE_* for this usercmd.
 UpdateGround(id, msec)
 {
     if (pev(id, pev_movetype) == MOVETYPE_FLY || pev(id, pev_waterlevel) >= 2)
@@ -1740,6 +1952,8 @@ UpdateGround(id, msec)
     g_iGroundMs[id] += msec;
     return MOVE_GROUND;
 }
+// Jump / duck scripts: perfect, frame-exact, 1-frame tap and
+// constant-interval spam presses on landing.
 TrackButton(id, b, buttons, moveType, msec)
 {
     new bit = g_iBtnBit[b];
@@ -1871,6 +2085,8 @@ TrackButton(id, b, buttons, moveType, msec)
         g_iBtnSpamPrev[id][b] = 0;
     }
 }
+// True when forward / side move match a key combination for the
+// client speed cvars.
 bool:IsKeyboardRatio(id, Float:fmove, Float:smove)
 {
     new Float:fwd  = (fmove > 0.0) ? g_fCl[id][CL_FWD] : g_fCl[id][CL_BACK];
@@ -1888,21 +2104,365 @@ bool:IsKeyboardRatio(id, Float:fmove, Float:smove)
     }
     return false;
 }
-bool:CountFlag(id, st, flag, need, Float:window, const what[], Float:mult = 1.0)
+bool:MoveRotated(id, Float:fmove, Float:smove)
 {
-    PushEvent(id, st, true);
-    new total, hits;
-    CountStream(id, st, window, total, hits);
-    if (need < 1)
-        need = 1;
-    if (hits < need)
+    if (floatabs(fmove) < VECTOR_MIN_MOVE || floatabs(smove) < VECTOR_MIN_MOVE)
         return false;
-    new detail[224];
-    formatex(detail, charsmax(detail), "%s: %d in %.0f sec", what, hits, window);
-    ClearStream(id, st);
-    AddViolation(id, flag, detail, 0.0, mult);
-    return true;
+    return !IsKeyboardRatio(id, fmove, smove);
 }
+// Movement keys are held but the move is zeroed.
+// Not checked while the player cannot move (freezetime / buy time, frozen,
+// locked speed) and for a short time after the unlock, because the client
+// keeps sending the locked (zero) move until it gets the new maxspeed.
+CheckAutostop(id, Float:fmove, Float:smove, buttons, Float:now)
+{
+    new Float:unlock = AUTOSTOP_UNLOCK + float(g_iPing[id]) / 1000.0;
+    if (g_bFreezeTime && now > g_fFreezeMax)
+    {
+        g_bFreezeTime = false;
+        g_fFreezeEnd  = g_fFreezeMax;
+    }
+    new Float:maxspeed;
+    pev(id, pev_maxspeed, maxspeed);
+    if (g_bFreezeTime || maxspeed <= 1.0 || (pev(id, pev_flags) & FL_FROZEN))
+    {
+        g_fSpeedLockUntil[id] = now + unlock;
+        return;
+    }
+    if (now <= g_fSpeedLockUntil[id] || now <= g_fFreezeEnd + unlock)
+        return;
+    new fb = buttons & (IN_FORWARD | IN_BACK);
+    new sb = buttons & (IN_MOVELEFT | IN_MOVERIGHT);
+    new bool:fKey = (fb == IN_FORWARD || fb == IN_BACK);
+    new bool:sKey = (sb == IN_MOVELEFT || sb == IN_MOVERIGHT);
+    if (!fKey && !sKey)
+        return;
+    new bool:bad = (fKey && floatabs(fmove) < 0.5) || (sKey && floatabs(smove) < 0.5);
+    if (!bad)
+        return;
+    CountFlag(id, ST_AUTOSTOP, DETECT_AUTOSTOP, CVI(CV_AUTOSTOP_COUNT), CVF(CV_AUTOSTOP_WINDOW),
+        "autostop, movement keys held with zero move, frames");
+}
+// Strafe key switches on the same frame as the mouse direction.
+CheckStrafe(id, Float:dyaw, Float:smove)
+{
+    new mouseDir = 0;
+    if (dyaw > 0.05)
+        mouseDir = 1;
+    else if (dyaw < -0.05)
+        mouseDir = -1;
+    if (mouseDir == 0)
+        return;
+    if (mouseDir == g_iLastMouseDir[id])
+    {
+        g_fSegYaw[id] += floatabs(dyaw);
+        return;
+    }
+    if (g_iLastMouseDir[id] != 0 && g_fSegYaw[id] >= CVF(CV_STRAFE_MINTURN))
+    {
+        new sideDir = SideDir(smove);
+        PushEvent(id, ST_STRAFE, sideDir == mouseDir && g_iLastSideDir[id] != mouseDir);
+        CheckStreamFlag(id, ST_STRAFE, DETECT_STRAFE, CVI(CV_STRAFE_SAMPLES), CVI(CV_STRAFE_PERCENT),
+            "strafe helper, same-frame switches");
+    }
+    g_iLastMouseDir[id] = mouseDir;
+    g_fSegYaw[id]       = floatabs(dyaw);
+}
+// Sign of a move value: 1, -1, or 0 below one unit.
+MoveSign(Float:v)
+{
+    if (v >= 1.0)
+        return 1;
+    if (v <= -1.0)
+        return -1;
+    return 0;
+}
+// One move axis of CheckNoKeys:
+//   0 = no move, 1 = backed by a key, 2 = held over, 3 = move without keys.
+// "Held over" is a move with the same direction as the last key that was
+// really held on this axis. The client produces it when the key state is
+// frozen while the ESC menu / console is open: the move keeps its old value
+// but the key bits are gone, and it can stay like that after the menu is
+// closed until the key is pressed again. Cheats that move without keys
+// (auto strafe, move bots) change the direction on their own, so a new
+// direction without a key is still reported.
+NoKeysAxis(id, axis, dir, bool:keyed, bool:still)
+{
+    if (dir == 0)
+    {
+        // A stopped move ends the held-over state, unless the view is frozen
+        // (menu open): then the client may resume the old move later.
+        if (!still)
+            g_iNkSign[id][axis] = 0;
+        return 0;
+    }
+    if (keyed)
+    {
+        g_iNkSign[id][axis] = dir;
+        return 1;
+    }
+    if (dir == g_iNkSign[id][axis])
+        return 2;
+    g_iNkSign[id][axis] = 0;
+    return 3;
+}
+// Move values without the matching buttons. Called for every usercmd so
+// the held-over state is kept up to date; doCount = false only tracks.
+// still = view angles did not change since the previous usercmd.
+CheckNoKeys(id, Float:fmove, Float:smove, buttons, bool:still, bool:doCount)
+{
+    new sSign = MoveSign(smove);
+    new fSign = MoveSign(fmove);
+    new bool:sKey, bool:fKey;
+    if (sSign < 0)
+        sKey = (buttons & (IN_MOVELEFT | IN_LEFT)) != 0;
+    else
+        sKey = (buttons & (IN_MOVERIGHT | IN_RIGHT)) != 0;
+    if (fSign > 0)
+        fKey = (buttons & IN_FORWARD) != 0;
+    else
+        fKey = (buttons & IN_BACK) != 0;
+    new sState = NoKeysAxis(id, NK_SIDE, sSign, sKey, still);
+    new fState = NoKeysAxis(id, NK_FWD, fSign, fKey, still);
+    if (!doCount)
+        return;
+    new bool:bad = (sState == 3 || fState == 3);
+    // Frozen view: the mouse is not in the game (menu / console open), the
+    // usercmd does not carry live input. Movement cheats turn the view.
+    if (bad && still)
+        return;
+    // Only a held-over move (or no move at all): not a sample.
+    if (!bad && sState != 1 && fState != 1)
+        return;
+    PushEvent(id, ST_NOKEYS, bad);
+    if (bad)
+        CheckStreamFlag(id, ST_NOKEYS, DETECT_NOKEYS, CVI(CV_NOKEYS_SAMPLES), CVI(CV_NOKEYS_PERCENT),
+            "move without keys, frames");
+}
+// Move vector that a keyboard cannot produce (rotated by a cheat).
+CheckVector(id, Float:fmove, Float:smove)
+{
+    if (floatabs(fmove) < VECTOR_MIN_MOVE || floatabs(smove) < VECTOR_MIN_MOVE)
+        return;
+    new bool:bad = !IsKeyboardRatio(id, fmove, smove);
+    PushEvent(id, ST_VECTOR, bad);
+    if (bad)
+        CheckStreamFlag(id, ST_VECTOR, DETECT_VECTOR, CVI(CV_VECTOR_SAMPLES), CVI(CV_VECTOR_PERCENT),
+            "non-keyboard move vector, frames", 0.0, VERIFY_VECTOR);
+}
+// Left / right switches faster than a human can press.
+CheckFastSwitch(id, Float:smove, msec)
+{
+    new sign = SideDir(smove);
+    if (sign == 0 || sign == g_iLastSideSign[id])
+    {
+        g_iHoldMs[id] += msec;
+        return;
+    }
+    if (g_iLastSideSign[id] == 0)
+    {
+        g_iLastSideSign[id] = sign;
+        g_iHoldMs[id]       = msec;
+        return;
+    }
+    PushEvent(id, ST_FASTSW, g_iHoldMs[id] <= CVI(CV_FS_MS));
+    g_iLastSideSign[id] = sign;
+    g_iHoldMs[id]       = msec;
+    CheckStreamFlag(id, ST_FASTSW, DETECT_FASTSTRAFE, CVI(CV_FS_SAMPLES), CVI(CV_FS_PERCENT),
+        "fast strafe switch");
+}
+// Targets and lag compensation
+// Line of sight through glass and other see-through entities.
+bool:TraceClear(skip, const Float:from[3], const Float:to[3])
+{
+    new Float:start[3], Float:frac, Float:endpos[3];
+    new hit, ignore = skip;
+    start[0] = from[0];
+    start[1] = from[1];
+    start[2] = from[2];
+    for (new pass = 0; pass <= TRACE_PASSES; pass++)
+    {
+        engfunc(EngFunc_TraceLine, start, to, IGNORE_MONSTERS | IGNORE_GLASS, ignore, 0);
+        get_tr2(0, TR_flFraction, frac);
+        if (frac >= 1.0)
+            return true;
+        hit = get_tr2(0, TR_pHit);
+        if (hit <= 32 || !pev_valid(hit) || pev(hit, pev_rendermode) == kRenderNormal)
+            return false;
+        get_tr2(0, TR_vecEndPos, endpos);
+        start[0] = endpos[0];
+        start[1] = endpos[1];
+        start[2] = endpos[2];
+        ignore   = hit;
+    }
+    return false;
+}
+// Refreshes the alive / team cache and, when asked, the position history.
+SnapshotPlayers(Float:now, bool:record)
+{
+    new h, Float:org[3];
+    for (new e = 1; e <= g_iMaxPlayers; e++)
+    {
+        g_bAlive[e] = (is_user_alive(e) != 0);
+        if (!g_bAlive[e])
+        {
+            g_iTeam[e]   = 0;
+            g_iRwFill[e] = 0;
+            continue;
+        }
+        g_iTeam[e] = get_user_team(e);
+        if (!record)
+            continue;
+        h = g_iRwHead[e];
+        pev(e, pev_origin, org);
+        g_fRwOrg[e][h][0] = org[0];
+        g_fRwOrg[e][h][1] = org[1];
+        g_fRwOrg[e][h][2] = org[2];
+        g_bRwDuck[e][h] = (pev(e, pev_flags) & FL_DUCKING) != 0;
+        g_fRwTime[e][h] = now;
+        g_iRwHead[e] = (h + 1) % RW_SIZE;
+        if (g_iRwFill[e] < RW_SIZE)
+            g_iRwFill[e]++;
+    }
+}
+public fw_StartFrame()
+{
+    new Float:now = get_gametime();
+    if (now >= g_fRwLast && now - g_fRwLast < RW_STEP)
+        return FMRES_IGNORED;
+    g_fRwLast = now;
+    SnapshotPlayers(now, CVI(CV_REWIND) != 0);
+    return FMRES_IGNORED;
+}
+// Position of a player at time t, interpolated from the history.
+GetRewound(e, Float:t, Float:out[3], &bool:duck)
+{
+    new fill = g_iRwFill[e];
+    if (fill == 0)
+    {
+        pev(e, pev_origin, out);
+        duck = (pev(e, pev_flags) & FL_DUCKING) != 0;
+        return;
+    }
+    new newer = (g_iRwHead[e] - 1 + RW_SIZE) % RW_SIZE;
+    new older;
+    if (g_fRwTime[e][newer] <= t)
+    {
+        out[0] = g_fRwOrg[e][newer][0];
+        out[1] = g_fRwOrg[e][newer][1];
+        out[2] = g_fRwOrg[e][newer][2];
+        duck = g_bRwDuck[e][newer];
+        return;
+    }
+    for (new i = 1; i < fill; i++)
+    {
+        older = (g_iRwHead[e] - 1 - i + RW_SIZE * 2) % RW_SIZE;
+        if (g_fRwTime[e][older] <= t)
+        {
+            new Float:span = g_fRwTime[e][newer] - g_fRwTime[e][older];
+            new Float:f = (span > 0.0) ? (t - g_fRwTime[e][older]) / span : 0.0;
+            new Float:jump = get_distance_f(g_fRwOrg[e][older], g_fRwOrg[e][newer]);
+            if (jump > 64.0)
+                f = 1.0;
+            for (new k = 0; k < 3; k++)
+                out[k] = g_fRwOrg[e][older][k] + (g_fRwOrg[e][newer][k] - g_fRwOrg[e][older][k]) * f;
+            duck = g_bRwDuck[e][(f < 0.5) ? older : newer];
+            return;
+        }
+        newer = older;
+    }
+    out[0] = g_fRwOrg[e][newer][0];
+    out[1] = g_fRwOrg[e][newer][1];
+    out[2] = g_fRwOrg[e][newer][2];
+    duck = g_bRwDuck[e][newer];
+}
+Float:LerpSec(id)
+{
+    new Float:lerp = g_fCl[id][CL_INTERP];
+    if (lerp < 0.01)
+        lerp = 0.01;
+    if (lerp > 0.1)
+        lerp = 0.1;
+    return lerp;
+}
+// Angle between the view and the nearest visible enemy (AIM_NONE if none).
+// onTarget is set when the view line passes within ac_hit_radius.
+Float:AimError(id, const Float:angles[3], &target, &bool:onTarget)
+{
+    target   = 0;
+    onTarget = false;
+    new Float:eye[3], Float:dir[3];
+    GetEye(id, eye);
+    new Float:sp = floatsin(angles[0], degrees);
+    new Float:cp = floatcos(angles[0], degrees);
+    new Float:sy = floatsin(angles[1], degrees);
+    new Float:cy = floatcos(angles[1], degrees);
+    dir[0] = cp * cy;
+    dir[1] = cp * sy;
+    dir[2] = -sp;
+    new bool:rewind = CVI(CV_REWIND) != 0;
+    new Float:when = get_gametime() - float(g_iPing[id]) / 1000.0 - LerpSec(id);
+    new team = get_user_team(id);
+    new Float:org[3], Float:base[3], Float:q[3], Float:bestQ[3], Float:p[3];
+    new bool:duck;
+    new Float:h, Float:w0[3], Float:b, Float:d, Float:ez, Float:den, Float:t, Float:s, Float:dist, Float:err;
+    new Float:best = AIM_NONE, Float:bestDist = 0.0;
+    for (new e = 1; e <= g_iMaxPlayers; e++)
+    {
+        if (e == id || !g_bAlive[e] || g_iTeam[e] == team)
+            continue;
+        if (rewind)
+            GetRewound(e, when, org, duck);
+        else
+        {
+            pev(e, pev_origin, org);
+            duck = (pev(e, pev_flags) & FL_DUCKING) != 0;
+        }
+        base[0] = org[0];
+        base[1] = org[1];
+        base[2] = org[2] + (duck ? -12.0 : -28.0);
+        h = duck ? 25.0 : 55.0;
+        for (new i = 0; i < 3; i++)
+            w0[i] = eye[i] - base[i];
+        b   = dir[2];
+        d   = dir[0] * w0[0] + dir[1] * w0[1] + dir[2] * w0[2];
+        ez  = w0[2];
+        den = 1.0 - b * b;
+        t   = (den < 0.0001) ? ez : (ez - b * d) / den;
+        if (t < 0.0)
+            t = 0.0;
+        if (t > h)
+            t = h;
+        s = t * b - d;
+        if (s < 16.0)
+            continue;
+        q[0] = base[0];
+        q[1] = base[1];
+        q[2] = base[2] + t;
+        for (new i = 0; i < 3; i++)
+            p[i] = eye[i] + dir[i] * s - q[i];
+        dist = floatsqroot(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+        err  = floatatan2(dist, s, degrees);
+        if (err < best)
+        {
+            best     = err;
+            bestDist = dist;
+            target   = e;
+            bestQ[0] = q[0];
+            bestQ[1] = q[1];
+            bestQ[2] = q[2];
+        }
+    }
+    if (!target || best > AIM_MAX_ERR || !TraceClear(id, eye, bestQ))
+    {
+        target = 0;
+        return AIM_NONE;
+    }
+    onTarget = (bestDist <= CVF(CV_HIT_RADIUS));
+    return best;
+}
+// Aim checks
+// Smallest yaw step the mouse can produce, 0.0 when it is unknown.
 Float:GcdStep(id, buttons)
 {
     if (buttons & (IN_LEFT | IN_RIGHT))
@@ -1918,6 +2478,7 @@ Float:GcdStep(id, buttons)
         return 0.0;
     return step;
 }
+// Is the turn a multiple of the mouse step? 1 = no, 0 = yes, -1 = skip.
 OffStep(Float:step, Float:v)
 {
     new Float:ad = floatabs(v);
@@ -1926,12 +2487,66 @@ OffStep(Float:step, Float:v)
     new Float:rem = floatabs(ad - step * float(floatround(ad / step)));
     return (rem > GCD_TOLERANCE) ? 1 : 0;
 }
-bool:MoveRotated(id, Float:fmove, Float:smove)
+// Pauses GCD until the view kick is over (ping covers the client delay).
+HitGrace(id, Float:now)
 {
-    if (floatabs(fmove) < VECTOR_MIN_MOVE || floatabs(smove) < VECTOR_MIN_MOVE)
-        return false;
-    return !IsKeyboardRatio(id, fmove, smove);
+    new Float:until = now + CVF(CV_GCD_HIT) + float(g_iPing[id]) / 1000.0;
+    if (until > g_fHitUntil[id])
+        g_fHitUntil[id] = until;
 }
+// Is the view moved by a kick that is not the mouse (hit, fall)?
+// The punch angle grows without own shooting -> a kick starts; while it is
+// still decaying the pause is held open.
+bool:HitView(id, buttons, Float:now)
+{
+    if (CVF(CV_GCD_HIT) <= 0.0)
+        return false;
+    new Float:punch[3];
+    pev(id, pev_punchangle, punch);
+    new Float:len = floatabs(punch[0]) + floatabs(punch[1]) + floatabs(punch[2]);
+    new bool:shooting = ((buttons | g_iLastButtons[id]) & IN_ATTACK) != 0;
+    if (!shooting && (len > g_fHitPunch[id] + HIT_PUNCH_MIN
+        || (len > HIT_PUNCH_IDLE && now <= g_fHitUntil[id])))
+        HitGrace(id, now);
+    g_fHitPunch[id] = len;
+    return now <= g_fHitUntil[id];
+}
+CheckGcd(id, Float:dyaw, buttons, Float:err)
+{
+    new bool:context = CVI(CV_GCD_CONTEXT) != 0;
+    if (context && err > CVF(CV_GCD_FOV))
+        return;
+    new bad = OffStep(GcdStep(id, buttons), dyaw);
+    if (bad < 0)
+        return;
+    PushEvent(id, ST_GCD, bad == 1);
+    if (bad == 1)
+        CheckStreamFlag(id, ST_GCD, DETECT_GCD, CVI(CV_GCD_SAMPLES), CVI(CV_GCD_PERCENT),
+            context ? "aim gcd near enemy, off-step turns" : "aim gcd, off-step turns", 0.0, VERIFY_GCD);
+}
+// View pitch that exactly compensates the punch angle.
+CheckRecoil(id, Float:pitch, buttons, weapon)
+{
+    new Float:punch[3];
+    pev(id, pev_punchangle, punch);
+    if ((buttons & IN_ATTACK) && WeaponIn(weapon, BITS_AUTO) && g_bHasPunch[id] && g_iAngHist[id] > 0)
+    {
+        new Float:dPunch = punch[0] - g_fLastPunch[id];
+        if (floatabs(dPunch) >= RECOIL_MIN_PUNCH)
+        {
+            new Float:dPitch = NormalizeAngle(pitch - g_fAngB[id][0]);
+            new bool:hit = (floatabs(dPitch + dPunch) < RECOIL_TOLERANCE
+                || floatabs(dPitch + 2.0 * dPunch) < RECOIL_TOLERANCE);
+            PushEvent(id, ST_RECOIL, hit);
+            if (hit)
+                CheckStreamFlag(id, ST_RECOIL, DETECT_NORECOIL, CVI(CV_RECOIL_SAMPLES), CVI(CV_RECOIL_PERCENT),
+                    "no-recoil, compensated frames");
+        }
+    }
+    g_fLastPunch[id] = punch[0];
+    g_bHasPunch[id]  = true;
+}
+// Strict conditions for a silent aim sample that may be punished at once.
 bool:SilentClean(id, msecC, Float:dAB, Float:dBC, Float:mn, Float:dAC, Float:errA, Float:errB, Float:errC)
 {
     if (g_bLag[id] || g_bHitch)
@@ -1972,6 +2587,7 @@ SilentInstant(id, const detail[])
     ClearStream(id, ST_SILENT_STRONG);
     StartVerify(id, VERIFY_SILENT, full, 1.0);
 }
+// One-frame turns around a shot: silent aim (turn and return) and aim snap.
 CheckSnap(id, const Float:angles[3], Float:dBC, buttons, Float:errC, Float:fmove, Float:smove, msec)
 {
     if (g_iLastMsec[id] <= 0 || g_iLastMsec[id] > 25 || g_bLag[id])
@@ -2027,6 +2643,7 @@ CheckSnap(id, const Float:angles[3], Float:dBC, buttons, Float:errC, Float:fmove
         dAB, errA, errB);
     CountFlag(id, ST_SNAP, DETECT_SNAP, CVI(CV_SNAP_COUNT), CVF(CV_SNAP_WINDOW), detail);
 }
+// Ends a smooth aim run and scores it.
 SmoothEnd(id, Float:err)
 {
     new run = g_iSmRun[id];
@@ -2048,6 +2665,7 @@ SmoothEnd(id, Float:err)
         run + 2, (g_fSmKMin[id] + g_fSmKMax[id]) * 0.5, g_iSmOff[id], known, g_fSmStartErr[id], err);
     CountFlag(id, ST_SMOOTH, DETECT_SMOOTH, CVI(CV_SMOOTH_COUNT), CVF(CV_SMOOTH_WINDOW), detail);
 }
+// Aim deltas shrinking by a constant factor every frame.
 CheckSmooth(id, Float:dp, Float:dy, buttons, Float:err)
 {
     new Float:mag = floatsqroot(dp * dp + dy * dy);
@@ -2123,324 +2741,7 @@ CheckSmooth(id, Float:dp, Float:dy, buttons, Float:err)
     g_fSmPrevDp[id]  = dp;
     g_fSmPrevDy[id]  = dy;
 }
-CheckAutostop(id, Float:fmove, Float:smove, buttons)
-{
-    new fb = buttons & (IN_FORWARD | IN_BACK);
-    new sb = buttons & (IN_MOVELEFT | IN_MOVERIGHT);
-    new bool:fKey = (fb == IN_FORWARD || fb == IN_BACK);
-    new bool:sKey = (sb == IN_MOVELEFT || sb == IN_MOVERIGHT);
-    if (!fKey && !sKey)
-        return;
-    if (pev(id, pev_flags) & FL_FROZEN)
-        return;
-    new Float:maxspeed;
-    pev(id, pev_maxspeed, maxspeed);
-    if (maxspeed <= 1.0)
-        return;
-    new bool:bad = (fKey && floatabs(fmove) < 0.5) || (sKey && floatabs(smove) < 0.5);
-    if (!bad)
-        return;
-    CountFlag(id, ST_AUTOSTOP, DETECT_AUTOSTOP, CVI(CV_AUTOSTOP_COUNT), CVF(CV_AUTOSTOP_WINDOW),
-        "autostop, movement keys held with zero move, frames");
-}
-CheckStrafe(id, Float:dyaw, Float:smove)
-{
-    new mouseDir = 0;
-    if (dyaw > 0.05)
-        mouseDir = 1;
-    else if (dyaw < -0.05)
-        mouseDir = -1;
-    if (mouseDir == 0)
-        return;
-    if (mouseDir == g_iLastMouseDir[id])
-    {
-        g_fSegYaw[id] += floatabs(dyaw);
-        return;
-    }
-    if (g_iLastMouseDir[id] != 0 && g_fSegYaw[id] >= CVF(CV_STRAFE_MINTURN))
-    {
-        new sideDir = SideDir(smove);
-        PushEvent(id, ST_STRAFE, sideDir == mouseDir && g_iLastSideDir[id] != mouseDir);
-        CheckStreamFlag(id, ST_STRAFE, DETECT_STRAFE, CVI(CV_STRAFE_SAMPLES), CVI(CV_STRAFE_PERCENT),
-            "strafe helper, same-frame switches");
-    }
-    g_iLastMouseDir[id] = mouseDir;
-    g_fSegYaw[id]       = floatabs(dyaw);
-}
-CheckNoKeys(id, Float:fmove, Float:smove, buttons)
-{
-    new bool:any = false;
-    new bool:bad = false;
-    if (floatabs(smove) >= 1.0)
-    {
-        any = true;
-        if (smove < 0.0 && !(buttons & (IN_MOVELEFT | IN_LEFT)))
-            bad = true;
-        else if (smove > 0.0 && !(buttons & (IN_MOVERIGHT | IN_RIGHT)))
-            bad = true;
-    }
-    if (floatabs(fmove) >= 1.0)
-    {
-        any = true;
-        if (fmove > 0.0 && !(buttons & IN_FORWARD))
-            bad = true;
-        else if (fmove < 0.0 && !(buttons & IN_BACK))
-            bad = true;
-    }
-    if (!any)
-        return;
-    PushEvent(id, ST_NOKEYS, bad);
-    if (bad)
-        CheckStreamFlag(id, ST_NOKEYS, DETECT_NOKEYS, CVI(CV_NOKEYS_SAMPLES), CVI(CV_NOKEYS_PERCENT),
-            "move without keys, frames");
-}
-CheckVector(id, Float:fmove, Float:smove)
-{
-    if (floatabs(fmove) < VECTOR_MIN_MOVE || floatabs(smove) < VECTOR_MIN_MOVE)
-        return;
-    new bool:bad = !IsKeyboardRatio(id, fmove, smove);
-    PushEvent(id, ST_VECTOR, bad);
-    if (bad)
-        CheckStreamFlag(id, ST_VECTOR, DETECT_VECTOR, CVI(CV_VECTOR_SAMPLES), CVI(CV_VECTOR_PERCENT),
-            "non-keyboard move vector, frames", 0.0, VERIFY_VECTOR);
-}
-CheckFastSwitch(id, Float:smove, msec)
-{
-    new sign = SideDir(smove);
-    if (sign == 0 || sign == g_iLastSideSign[id])
-    {
-        g_iHoldMs[id] += msec;
-        return;
-    }
-    if (g_iLastSideSign[id] == 0)
-    {
-        g_iLastSideSign[id] = sign;
-        g_iHoldMs[id]       = msec;
-        return;
-    }
-    PushEvent(id, ST_FASTSW, g_iHoldMs[id] <= CVI(CV_FS_MS));
-    g_iLastSideSign[id] = sign;
-    g_iHoldMs[id]       = msec;
-    CheckStreamFlag(id, ST_FASTSW, DETECT_FASTSTRAFE, CVI(CV_FS_SAMPLES), CVI(CV_FS_PERCENT),
-        "fast strafe switch");
-}
-CheckGcd(id, Float:dyaw, buttons, Float:err)
-{
-    new bool:context = CVI(CV_GCD_CONTEXT) != 0;
-    if (context && err > CVF(CV_GCD_FOV))
-        return;
-    new bad = OffStep(GcdStep(id, buttons), dyaw);
-    if (bad < 0)
-        return;
-    PushEvent(id, ST_GCD, bad == 1);
-    if (bad == 1)
-        CheckStreamFlag(id, ST_GCD, DETECT_GCD, CVI(CV_GCD_SAMPLES), CVI(CV_GCD_PERCENT),
-            context ? "aim gcd near enemy, off-step turns" : "aim gcd, off-step turns", 0.0, VERIFY_GCD);
-}
-CheckRecoil(id, Float:pitch, buttons, weapon)
-{
-    new Float:punch[3];
-    pev(id, pev_punchangle, punch);
-    if ((buttons & IN_ATTACK) && WeaponIn(weapon, BITS_AUTO) && g_bHasPunch[id] && g_iAngHist[id] > 0)
-    {
-        new Float:dPunch = punch[0] - g_fLastPunch[id];
-        if (floatabs(dPunch) >= RECOIL_MIN_PUNCH)
-        {
-            new Float:dPitch = NormalizeAngle(pitch - g_fAngB[id][0]);
-            new bool:hit = (floatabs(dPitch + dPunch) < RECOIL_TOLERANCE
-                || floatabs(dPitch + 2.0 * dPunch) < RECOIL_TOLERANCE);
-            PushEvent(id, ST_RECOIL, hit);
-            if (hit)
-                CheckStreamFlag(id, ST_RECOIL, DETECT_NORECOIL, CVI(CV_RECOIL_SAMPLES), CVI(CV_RECOIL_PERCENT),
-                    "no-recoil, compensated frames");
-        }
-    }
-    g_fLastPunch[id] = punch[0];
-    g_bHasPunch[id]  = true;
-}
-bool:TraceClear(skip, const Float:from[3], const Float:to[3])
-{
-    new Float:start[3], Float:frac, Float:endpos[3];
-    new hit, ignore = skip;
-    start[0] = from[0];
-    start[1] = from[1];
-    start[2] = from[2];
-    for (new pass = 0; pass <= WH_PASSES; pass++)
-    {
-        engfunc(EngFunc_TraceLine, start, to, IGNORE_MONSTERS | IGNORE_GLASS, ignore, 0);
-        get_tr2(0, TR_flFraction, frac);
-        if (frac >= 1.0)
-            return true;
-        hit = get_tr2(0, TR_pHit);
-        if (hit <= 32 || !pev_valid(hit) || pev(hit, pev_rendermode) == kRenderNormal)
-            return false;
-        get_tr2(0, TR_vecEndPos, endpos);
-        start[0] = endpos[0];
-        start[1] = endpos[1];
-        start[2] = endpos[2];
-        ignore   = hit;
-    }
-    return false;
-}
-RecordPositions()
-{
-    new Float:now = get_gametime();
-    if (now >= g_fRwLast && now - g_fRwLast < RW_STEP)
-        return;
-    g_fRwLast = now;
-    new h, Float:org[3];
-    for (new e = 1; e < MAXP; e++)
-    {
-        if (!is_user_alive(e))
-        {
-            g_iRwFill[e] = 0;
-            continue;
-        }
-        h = g_iRwHead[e];
-        pev(e, pev_origin, org);
-        g_fRwOrg[e][h][0] = org[0];
-        g_fRwOrg[e][h][1] = org[1];
-        g_fRwOrg[e][h][2] = org[2];
-        g_bRwDuck[e][h] = (pev(e, pev_flags) & FL_DUCKING) != 0;
-        g_fRwTime[e][h] = now;
-        g_iRwHead[e] = (h + 1) % RW_SIZE;
-        if (g_iRwFill[e] < RW_SIZE)
-            g_iRwFill[e]++;
-    }
-}
-public fw_StartFrame()
-{
-    if (CVI(CV_REWIND))
-        RecordPositions();
-    return FMRES_IGNORED;
-}
-GetRewound(e, Float:t, Float:out[3], &bool:duck)
-{
-    new fill = g_iRwFill[e];
-    if (fill == 0)
-    {
-        pev(e, pev_origin, out);
-        duck = (pev(e, pev_flags) & FL_DUCKING) != 0;
-        return;
-    }
-    new newer = (g_iRwHead[e] - 1 + RW_SIZE) % RW_SIZE;
-    new older;
-    if (g_fRwTime[e][newer] <= t)
-    {
-        out[0] = g_fRwOrg[e][newer][0];
-        out[1] = g_fRwOrg[e][newer][1];
-        out[2] = g_fRwOrg[e][newer][2];
-        duck = g_bRwDuck[e][newer];
-        return;
-    }
-    for (new i = 1; i < fill; i++)
-    {
-        older = (g_iRwHead[e] - 1 - i + RW_SIZE * 2) % RW_SIZE;
-        if (g_fRwTime[e][older] <= t)
-        {
-            new Float:span = g_fRwTime[e][newer] - g_fRwTime[e][older];
-            new Float:f = (span > 0.0) ? (t - g_fRwTime[e][older]) / span : 0.0;
-            new Float:jump = get_distance_f(g_fRwOrg[e][older], g_fRwOrg[e][newer]);
-            if (jump > 64.0)
-                f = 1.0;
-            for (new k = 0; k < 3; k++)
-                out[k] = g_fRwOrg[e][older][k] + (g_fRwOrg[e][newer][k] - g_fRwOrg[e][older][k]) * f;
-            duck = g_bRwDuck[e][(f < 0.5) ? older : newer];
-            return;
-        }
-        newer = older;
-    }
-    out[0] = g_fRwOrg[e][newer][0];
-    out[1] = g_fRwOrg[e][newer][1];
-    out[2] = g_fRwOrg[e][newer][2];
-    duck = g_bRwDuck[e][newer];
-}
-Float:LerpSec(id)
-{
-    new Float:lerp = g_fCl[id][CL_INTERP];
-    if (lerp < 0.01)
-        lerp = 0.01;
-    if (lerp > 0.1)
-        lerp = 0.1;
-    return lerp;
-}
-Float:AimError(id, const Float:angles[3], &target, &bool:onTarget)
-{
-    target   = 0;
-    onTarget = false;
-    new Float:eye[3], Float:ofs[3], Float:dir[3];
-    pev(id, pev_origin, eye);
-    pev(id, pev_view_ofs, ofs);
-    for (new i = 0; i < 3; i++)
-        eye[i] += ofs[i];
-    new Float:sp = floatsin(angles[0], degrees);
-    new Float:cp = floatcos(angles[0], degrees);
-    new Float:sy = floatsin(angles[1], degrees);
-    new Float:cy = floatcos(angles[1], degrees);
-    dir[0] = cp * cy;
-    dir[1] = cp * sy;
-    dir[2] = -sp;
-    new bool:rewind = CVI(CV_REWIND) != 0;
-    new Float:when = get_gametime() - float(g_iPing[id]) / 1000.0 - LerpSec(id);
-    new team = get_user_team(id);
-    new Float:org[3], Float:base[3], Float:q[3], Float:bestQ[3], Float:p[3];
-    new bool:duck;
-    new Float:h, Float:w0[3], Float:b, Float:d, Float:ez, Float:den, Float:t, Float:s, Float:dist, Float:err;
-    new Float:best = AIM_NONE, Float:bestDist = 0.0;
-    for (new e = 1; e < MAXP; e++)
-    {
-        if (e == id || !is_user_alive(e) || get_user_team(e) == team)
-            continue;
-        if (rewind)
-            GetRewound(e, when, org, duck);
-        else
-        {
-            pev(e, pev_origin, org);
-            duck = (pev(e, pev_flags) & FL_DUCKING) != 0;
-        }
-        base[0] = org[0];
-        base[1] = org[1];
-        base[2] = org[2] + (duck ? -12.0 : -28.0);
-        h = duck ? 25.0 : 55.0;
-        for (new i = 0; i < 3; i++)
-            w0[i] = eye[i] - base[i];
-        b   = dir[2];
-        d   = dir[0] * w0[0] + dir[1] * w0[1] + dir[2] * w0[2];
-        ez  = w0[2];
-        den = 1.0 - b * b;
-        t   = (den < 0.0001) ? ez : (ez - b * d) / den;
-        if (t < 0.0)
-            t = 0.0;
-        if (t > h)
-            t = h;
-        s = t * b - d;
-        if (s < 16.0)
-            continue;
-        q[0] = base[0];
-        q[1] = base[1];
-        q[2] = base[2] + t;
-        for (new i = 0; i < 3; i++)
-            p[i] = eye[i] + dir[i] * s - q[i];
-        dist = floatsqroot(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
-        err  = floatatan2(dist, s, degrees);
-        if (err < best)
-        {
-            best     = err;
-            bestDist = dist;
-            target   = e;
-            bestQ[0] = q[0];
-            bestQ[1] = q[1];
-            bestQ[2] = q[2];
-        }
-    }
-    if (!target || best > AIM_MAX_ERR || !TraceClear(id, eye, bestQ))
-    {
-        target = 0;
-        return AIM_NONE;
-    }
-    onTarget = (bestDist <= CVF(CV_HIT_RADIUS));
-    return best;
-}
+// Shots fired the moment the crosshair reaches an enemy.
 CheckTrigger(id, bool:on, buttons, Float:speed)
 {
     if (on && !g_bOnTarget[id])
@@ -2464,6 +2765,7 @@ CheckTrigger(id, bool:on, buttons, Float:speed)
         CheckStreamFlag(id, ST_TRIGGER, DETECT_TRIGGER, CVI(CV_TRIGGER_SAMPLES), CVI(CV_TRIGGER_PERCENT),
             "triggerbot, instant shots");
 }
+// Pistol clicks with a constant interval / hold pattern.
 CheckAutofire(id, buttons, weapon, msec)
 {
     new bool:down = (buttons & IN_ATTACK) != 0;
@@ -2527,6 +2829,7 @@ CheckAutofire(id, buttons, weapon, msec)
         CheckStreamFlag(id, ST_AUTOFIRE, DETECT_AUTOFIRE, CVI(CV_AUTOFIRE_SAMPLES), CVI(CV_AUTOFIRE_PERCENT),
             "autofire, equal click pattern");
 }
+// Usercmd processing
 public fw_CmdStart(id, uc_handle, seed)
 {
     if (id < 1 || id >= MAXP || g_bIgnore[id] || g_bKicked[id])
@@ -2536,9 +2839,10 @@ public fw_CmdStart(id, uc_handle, seed)
         g_bWasAlive[id] = false;
         return FMRES_IGNORED;
     }
-    new msec    = get_uc(uc_handle, UC_Msec);
-    new buttons = get_uc(uc_handle, UC_Buttons);
-    new weapon  = get_user_weapon(id);
+    new msec      = get_uc(uc_handle, UC_Msec);
+    new buttons   = get_uc(uc_handle, UC_Buttons);
+    new weapon    = get_user_weapon(id);
+    new Float:now = get_gametime();
     if (!g_bWasAlive[id])
     {
         g_bWasAlive[id]       = true;
@@ -2546,6 +2850,8 @@ public fw_CmdStart(id, uc_handle, seed)
         g_iLastMouseDir[id]   = 0;
         g_iLastSideSign[id]   = 0;
         g_bHasPunch[id]       = false;
+        g_fHitUntil[id]       = 0.0;
+        g_fHitPunch[id]       = 0.0;
         g_bOnTarget[id]       = false;
         g_bTargetIdle[id]     = false;
         g_iLastPress[id]      = 0;
@@ -2555,7 +2861,7 @@ public fw_CmdStart(id, uc_handle, seed)
         g_iPrevHold[id]       = 0;
         g_iAttackHold[id]     = 0;
         g_iAttackLastHold[id] = 0;
-        g_fGraceUntil[id]     = get_gametime() + SPAWN_GRACE;
+        g_fGraceUntil[id]     = now + SPAWN_GRACE;
         ResetButtons(id);
         ResetAim(id);
         g_iLastButtons[id] = buttons;
@@ -2569,12 +2875,13 @@ public fw_CmdStart(id, uc_handle, seed)
     g_iClock[id] += msec;
     g_iFrames[id]++;
     g_iFrameNo[id]++;
-    new bool:grace = (get_gametime() <= g_fGraceUntil[id]);
+    new bool:grace = (now <= g_fGraceUntil[id]);
+    new bool:hitView = HitView(id, buttons, now);
     new moveType = UpdateGround(id, msec);
     TrackButton(id, BTN_JUMP, buttons, moveType, msec);
     TrackButton(id, BTN_DUCK, buttons, moveType, msec);
-    if (moveType != MOVE_OTHER && CVI(CV_NOKEYS) && !grace)
-        CheckNoKeys(id, fmove, smove, buttons);
+    new bool:still = (g_iAngHist[id] > 0 && angles[0] == g_fAngB[id][0] && angles[1] == g_fAngB[id][1]);
+    CheckNoKeys(id, fmove, smove, buttons, still, moveType != MOVE_OTHER && CVI(CV_NOKEYS) != 0 && !grace);
     if (moveType == MOVE_AIR)
     {
         if (CVI(CV_VECTOR) && !grace)
@@ -2594,7 +2901,7 @@ public fw_CmdStart(id, uc_handle, seed)
     if (CVI(CV_RECOIL) && !grace)
         CheckRecoil(id, angles[0], buttons, weapon);
     if (CVI(CV_AUTOSTOP) && !grace && moveType != MOVE_OTHER)
-        CheckAutostop(id, fmove, smove, buttons);
+        CheckAutostop(id, fmove, smove, buttons, now);
     new Float:dBC  = 0.0;
     new Float:dyaw = 0.0;
     new Float:dpitch = 0.0;
@@ -2622,7 +2929,7 @@ public fw_CmdStart(id, uc_handle, seed)
         g_fYawSum[id] += floatabs(dyaw);
         if (moveType == MOVE_AIR && CVI(CV_STRAFE))
             CheckStrafe(id, dyaw, smove);
-        if (!grace && CVI(CV_GCD))
+        if (!grace && !hitView && CVI(CV_GCD))
             CheckGcd(id, dyaw, buttons, err);
         if (!grace && gun && CVI(CV_SMOOTH))
             CheckSmooth(id, dpitch, dyaw, buttons, err);
@@ -2635,13 +2942,13 @@ public fw_CmdStart(id, uc_handle, seed)
         g_fSegYaw[id]       = 0.0;
     }
     RecordFrame(id, moveType, msec, angles[0], angles[1], fmove, smove, buttons);
-    if (g_fDebugUntil[id] > get_gametime())
+    if (g_fDebugUntil[id] > now)
     {
         new name[32], line[160];
         get_user_name(id, name, charsmax(name));
         FormatFrame(line, charsmax(line), moveType, msec, angles[0], angles[1], fmove, smove, buttons);
-        LogFile(DEBUG_FILE, "%s | %s dyaw=%.3f dpitch=%.3f aimerr=%.2f%s tgt=%d gf=%d", name, line, dyaw, dpitch,
-            (err >= AIM_NONE) ? -1.0 : err, onTarget ? " ON" : "", target, g_iGroundFrames[id]);
+        LogFile(DEBUG_FILE, "%s | %s dyaw=%.3f dpitch=%.3f aimerr=%.2f%s%s tgt=%d gf=%d", name, line, dyaw, dpitch,
+            (err >= AIM_NONE) ? -1.0 : err, onTarget ? " ON" : "", hitView ? " HIT" : "", target, g_iGroundFrames[id]);
     }
     g_iLastSideDir[id] = SideDir(smove);
     g_fAngA[id][0] = g_fAngB[id][0];
@@ -2663,95 +2970,8 @@ public fw_CmdStart(id, uc_handle, seed)
     g_iLastButtons[id] = buttons;
     return FMRES_IGNORED;
 }
-bool:IsVisible(host, ent)
-{
-    new Float:eye[3], Float:ofs[3], Float:vel[3], Float:org[3], Float:evel[3];
-    new Float:mins[3], Float:maxs[3];
-    pev(host, pev_origin, eye);
-    pev(host, pev_view_ofs, ofs);
-    pev(host, pev_velocity, vel);
-    pev(ent, pev_origin, org);
-    pev(ent, pev_velocity, evel);
-    pev(ent, pev_absmin, mins);
-    pev(ent, pev_absmax, maxs);
-    for (new i = 0; i < 3; i++)
-        eye[i] += ofs[i];
-    new Float:dx = org[0] - eye[0];
-    new Float:dy = org[1] - eye[1];
-    new Float:dz = org[2] - eye[2];
-    new Float:dist = floatsqroot(dx * dx + dy * dy + dz * dz);
-    if (dist < WH_NEAR)
-        return true;
-    new ping, loss;
-    get_user_ping(host, ping, loss);
-    new Float:predict = WH_PREDICT_MIN + float(ping) / 1000.0;
-    if (predict > WH_PREDICT_MAX)
-        predict = WH_PREDICT_MAX;
-    new Float:flat = floatsqroot(dx * dx + dy * dy);
-    if (flat < 1.0)
-        flat = 1.0;
-    new Float:rx = -dy / flat * WH_SIDE;
-    new Float:ry =  dx / flat * WH_SIDE;
-    new Float:top = maxs[2] - 2.0;
-    new Float:bot = mins[2] + 4.0;
-    if (top <= bot)
-    {
-        top = org[2] + 28.0;
-        bot = org[2] - 28.0;
-    }
-    new Float:eyes[2][3];
-    new Float:pts[7][3];
-    for (new i = 0; i < 3; i++)
-    {
-        eyes[0][i] = eye[i];
-        eyes[1][i] = eye[i] + vel[i] * predict;
-        for (new p = 0; p < 6; p++)
-            pts[p][i] = org[i];
-        pts[6][i] = org[i] + evel[i] * predict;
-    }
-    pts[1][2] = top;
-    pts[2][2] = bot;
-    pts[3][0] += rx;
-    pts[3][1] += ry;
-    pts[4][0] -= rx;
-    pts[4][1] -= ry;
-    pts[3][2] = top - 8.0;
-    pts[4][2] = top - 8.0;
-    pts[5][2] = top;
-    pts[5][0] += evel[0] * predict;
-    pts[5][1] += evel[1] * predict;
-    for (new e = 0; e < 2; e++)
-    {
-        for (new p = 0; p < 7; p++)
-        {
-            if (TraceClear(host, eyes[e], pts[p]))
-                return true;
-        }
-    }
-    return false;
-}
-public fw_AddToFullPack(es, e, ent, host, hostflags, player, pSet)
-{
-    if (!player || !CVI(CV_ANTIWH) || ent == host)
-        return FMRES_IGNORED;
-    if (host < 1 || host > 32 || ent < 1 || ent > 32)
-        return FMRES_IGNORED;
-    if (g_bIgnore[host] || !is_user_alive(host) || !is_user_alive(ent))
-        return FMRES_IGNORED;
-    if (get_user_team(host) == get_user_team(ent))
-        return FMRES_IGNORED;
-    new Float:now = get_gametime();
-    if (now >= g_fVisTime[host][ent])
-    {
-        new bool:vis = IsVisible(host, ent);
-        g_bVisible[host][ent] = vis;
-        g_fVisTime[host][ent] = now + (vis ? WH_CACHE_SHOW : WH_CACHE_HIDE);
-    }
-    if (g_bVisible[host][ent])
-        return FMRES_IGNORED;
-    forward_return(FMV_CELL, 0);
-    return FMRES_SUPERCEDE;
-}
+// Once per second
+// VL decay, lag state and the per-second checks (speed, fps, pitch, spin).
 public task_SecondCheck()
 {
     CacheCvars();
@@ -2831,16 +3051,16 @@ public task_SecondCheck()
                 AddViolation(id, DETECT_SPEED, detail, float(secs));
             }
         }
-        if (CVI(CV_FPS))
-        {
-            FpsStats(id, secs, CVI(CV_FPS_MAX), fpsBad, maxFps);
-            if (fpsBad >= CVI(CV_FPS_WARNS))
-            {
-                formatex(detail, charsmax(detail), "high fps: %d/%d sec over %d, max %d",
-                    fpsBad, secs, CVI(CV_FPS_MAX), maxFps);
-                AddViolation(id, DETECT_FPS, detail, float(secs));
-            }
-        }
+        //if (CVI(CV_FPS))
+        //{
+        //    FpsStats(id, secs, CVI(CV_FPS_MAX), fpsBad, maxFps);
+        //    if (fpsBad >= CVI(CV_FPS_WARNS))
+        //    {
+        //        formatex(detail, charsmax(detail), "high fps: %d/%d sec over %d, max %d",
+        //            fpsBad, secs, CVI(CV_FPS_MAX), maxFps);
+        //        AddViolation(id, DETECT_FPS, detail, float(secs));
+        //    }
+        //}
         if (CVI(CV_SPIN) && spinBad >= CVI(CV_SPIN_WARNS))
         {
             formatex(detail, charsmax(detail), "spinbot: %d/%d sec over %.0f deg/sec",
@@ -2849,6 +3069,7 @@ public task_SecondCheck()
         }
     }
 }
+// Admin commands
 ListPlayers(id)
 {
     new players[32], num, pl, name[32], line[256], len, ping, loss;
